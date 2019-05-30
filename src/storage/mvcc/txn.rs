@@ -301,7 +301,7 @@ impl<S: Snapshot> MvccTxn<S> {
         Ok(())
     }
 
-    pub fn refresh_lock(&mut self, key: Key, ttl: u64) -> Result<u64> {
+    pub fn refresh_lock(&mut self, key: Key, lock_ttl: u64) -> Result<u64> {
         if let Some(lock) = self.reader.load_lock(&key)? {
             if lock.ts != self.start_ts {
                 // locked by another transaction
@@ -312,15 +312,31 @@ impl<S: Snapshot> MvccTxn<S> {
                     ttl: lock.ttl,
                 });
             }
-            // We should refresh lock here...
-            return Ok(ttl);
+            let value = lock.short_value;
+
+            if value.is_some() && is_short_value(value.as_ref().unwrap()) {
+                self.lock_key(key, lock.lock_type, lock.primary, lock_ttl, value);
+            } else {
+                self.lock_key(
+                    key.clone(),
+                    lock.lock_type,
+                    lock.primary,
+                    lock_ttl,
+                    None,
+                );
+                if value.is_some() {
+                    let ts = self.start_ts;
+                    self.put_value(key, ts, value.unwrap());
+                }
+            }
+            Ok(lock_ttl)
         } else {
             // the lock is outdated, should abort txn by client.
             return Err(Error::TxnLockNotFound {
                 start_ts: self.start_ts,
                 commit_ts: u64::max_value(),
                 key: key.as_encoded().to_owned(),
-            })
+            });
         }
     }
 
