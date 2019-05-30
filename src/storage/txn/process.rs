@@ -607,6 +607,36 @@ fn process_write_impl<S: Snapshot>(
             };
             (pr, modifies, rows, ctx)
         }
+        Command::RefreshLock {
+            ctx,
+            mut txn_status,
+            mut key,
+            start_ts,
+        } => {
+
+            let mut txn =
+                MvccTxn::new(snapshot.clone(), start_ts, !ctx.get_not_fill_cache())?;
+            let status = txn_status.get(&start_ts);
+            let commit_ts = match status {
+                Some(ts) => *ts,
+                None => panic!("txn status {} not found.", start_ts),
+            };
+            if commit_ts > 0 {
+                if start_ts >= commit_ts {
+                    return Err(Error::InvalidTxnTso {
+                        start_ts,
+                        commit_ts,
+                    });
+                }
+                txn.commit(key.clone(), commit_ts)?;
+            } else {
+                txn.rollback(key.clone())?;
+            }
+
+            statistics.add(&txn.take_statistics());
+
+            (ProcessResult::Res, txn.into_modifies(), 1, ctx)
+        }
         _ => panic!("unsupported write command"),
     };
 

@@ -134,6 +134,12 @@ pub enum Command {
         scan_key: Option<Key>,
         key_locks: Vec<(Key, Lock)>,
     },
+    RefreshLock {
+        ctx: Context,
+        txn_status: HashMap<u64, u64>,
+        key: Key,
+        start_ts: u64,
+    },
     DeleteRange {
         ctx: Context,
         start_key: Key,
@@ -212,6 +218,7 @@ impl Display for Command {
                 start_key, limit, max_ts, ctx
             ),
             Command::ResolveLock { .. } => write!(f, "kv::resolve_lock"),
+            Command::RefreshLock { .. } => write!(f, "kv::refresh_lock"),
             Command::DeleteRange {
                 ref ctx,
                 ref start_key,
@@ -291,6 +298,7 @@ impl Command {
             Command::Rollback { .. } => "rollback",
             Command::ScanLock { .. } => "scan_lock",
             Command::ResolveLock { .. } => "resolve_lock",
+            Command::RefreshLock { .. } => "refresh_lock",
             Command::DeleteRange { .. } => "delete_range",
             Command::Pause { .. } => "pause",
             Command::MvccByKey { .. } => "key_mvcc",
@@ -307,6 +315,7 @@ impl Command {
             Command::Commit { lock_ts, .. } => lock_ts,
             Command::ScanLock { max_ts, .. } => max_ts,
             Command::ResolveLock { .. }
+            | Command::RefreshLock { .. }
             | Command::DeleteRange { .. }
             | Command::Pause { .. }
             | Command::MvccByKey { .. } => 0,
@@ -321,6 +330,7 @@ impl Command {
             | Command::Rollback { ref ctx, .. }
             | Command::ScanLock { ref ctx, .. }
             | Command::ResolveLock { ref ctx, .. }
+            | Command::RefreshLock { ref ctx, .. }
             | Command::DeleteRange { ref ctx, .. }
             | Command::Pause { ref ctx, .. }
             | Command::MvccByKey { ref ctx, .. }
@@ -336,6 +346,7 @@ impl Command {
             | Command::Rollback { ref mut ctx, .. }
             | Command::ScanLock { ref mut ctx, .. }
             | Command::ResolveLock { ref mut ctx, .. }
+            | Command::RefreshLock { ref mut ctx, .. }
             | Command::DeleteRange { ref mut ctx, .. }
             | Command::Pause { ref mut ctx, .. }
             | Command::MvccByKey { ref mut ctx, .. }
@@ -364,6 +375,9 @@ impl Command {
             }
             Command::ResolveLock { ref key_locks, .. } => for lock in key_locks {
                 bytes += lock.0.as_encoded().len();
+            },
+            Command::RefreshLock { ref key, .. } => {
+                bytes += key.as_encoded().len();
             },
             Command::Cleanup { ref key, .. } => {
                 bytes += key.as_encoded().len();
@@ -862,6 +876,26 @@ impl<E: Engine> Storage<E> {
             txn_status,
             scan_key: None,
             key_locks: vec![],
+        };
+        let tag = cmd.tag();
+        self.schedule(cmd, StorageCb::Boolean(callback))?;
+        KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
+        Ok(())
+    }
+
+    pub fn async_refresh_lock(
+        &self,
+        ctx: Context,
+        txn_status: HashMap<u64, u64>,
+        key: Vec<u8>,
+        start_ts: u64,
+        callback: Callback<()>,
+    ) -> Result<()> {
+        let cmd = Command::RefreshLock {
+            ctx,
+            txn_status,
+            key: Key::from_raw(&key),
+            start_ts,
         };
         let tag = cmd.tag();
         self.schedule(cmd, StorageCb::Boolean(callback))?;

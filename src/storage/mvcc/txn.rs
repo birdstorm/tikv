@@ -301,6 +301,29 @@ impl<S: Snapshot> MvccTxn<S> {
         Ok(())
     }
 
+    pub fn refresh_lock(&mut self, key: Key) -> Result<()> {
+        if let Some(lock) = self.reader.load_lock(&key)? {
+            if lock.ts != self.start_ts {
+                // locked by another transaction
+                return Err(Error::KeyIsLocked {
+                    key: key.to_raw()?,
+                    primary: lock.primary,
+                    ts: lock.ts,
+                    ttl: lock.ttl,
+                });
+            }
+            // We should refresh lock here...
+            return Ok(());
+        } else {
+            // the lock is outdated, should abort txn by client.
+            return Err(Error::TxnLockNotFound {
+                start_ts: self.start_ts,
+                commit_ts: u64::max_value(),
+                key: key.as_encoded().to_owned(),
+            })
+        }
+    }
+
     fn collapse_prev_rollback(&mut self, key: Key) -> Result<()> {
         if let Some((commit_ts, write)) = self.reader.seek_write(&key, self.start_ts)? {
             if write.write_type == WriteType::Rollback {
