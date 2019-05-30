@@ -452,23 +452,21 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_refresh_lock.start_coarse_timer();
 
-        let txn_status =
-            HashMap::from_iter(
-                req.take_txn_infos()
-                    .into_iter()
-                    .map(|info| (info.txn, info.status)),
-            );
         let (cb, f) = paired_future_callback();
+        let ttl = req.get_ttl();
         let res = self
             .storage
-            .async_refresh_lock(req.take_context(), txn_status, req.key, req.start_version, cb);
+            .async_refresh_lock(req.take_context(), req.take_key(), req.get_start_version(), ttl, cb);
         let future = AndThenWith::new(res, f.map_err(Error::from))
-            .and_then(|v| {
+            .and_then(move |v| {
                 let mut resp = RefreshLockResponse::new();
                 if let Some(err) = extract_region_error(&v) {
                     resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(extract_key_error(&e));
+                } else {
+                    match v {
+                        Ok(()) => resp.set_ttl(ttl),
+                        Err(e) => resp.set_error(extract_key_error(&e)),
+                    }
                 }
                 sink.success(resp).map_err(Error::from)
             })

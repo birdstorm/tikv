@@ -301,7 +301,7 @@ impl<S: Snapshot> MvccTxn<S> {
         Ok(())
     }
 
-    pub fn refresh_lock(&mut self, key: Key) -> Result<()> {
+    pub fn refresh_lock(&mut self, key: Key, ttl: u64) -> Result<u64> {
         if let Some(lock) = self.reader.load_lock(&key)? {
             if lock.ts != self.start_ts {
                 // locked by another transaction
@@ -313,7 +313,7 @@ impl<S: Snapshot> MvccTxn<S> {
                 });
             }
             // We should refresh lock here...
-            return Ok(());
+            return Ok(ttl);
         } else {
             // the lock is outdated, should abort txn by client.
             return Err(Error::TxnLockNotFound {

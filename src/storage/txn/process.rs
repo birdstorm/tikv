@@ -609,33 +609,30 @@ fn process_write_impl<S: Snapshot>(
         }
         Command::RefreshLock {
             ctx,
-            mut txn_status,
             mut key,
             start_ts,
+            ttl,
         } => {
 
             let mut txn =
                 MvccTxn::new(snapshot.clone(), start_ts, !ctx.get_not_fill_cache())?;
-            let status = txn_status.get(&start_ts);
-            let commit_ts = match status {
-                Some(ts) => *ts,
-                None => panic!("txn status {} not found.", start_ts),
-            };
-            if commit_ts > 0 {
-                if start_ts >= commit_ts {
-                    return Err(Error::InvalidTxnTso {
-                        start_ts,
-                        commit_ts,
-                    });
+            let mut locks = vec![];
+            match txn.refresh_lock(key, ttl) {
+                Ok(lock) => {
+                    locks.push(lock)
                 }
-                txn.commit(key.clone(), commit_ts)?;
-            } else {
-                txn.rollback(key.clone())?;
+                Err(e) => return Err(Error::from(e)),
             }
 
             statistics.add(&txn.take_statistics());
-
-            (ProcessResult::Res, txn.into_modifies(), 1, ctx)
+            if locks.is_empty() {
+                // Skip write stage if no lock is found.
+                let pr = ProcessResult::Res;
+                (pr, vec![], 0, ctx)
+            } else {
+                let pr = ProcessResult::Res;
+                (pr, txn.into_modifies(), 1, ctx)
+            }
         }
         _ => panic!("unsupported write command"),
     };

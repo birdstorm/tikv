@@ -548,9 +548,9 @@ mod tests {
             },
             Command::RefreshLock {
                 ctx: Context::new(),
-                txn_status: temp_map.clone(),
                 key: Key::from_raw(b"k"),
-                lock: mvcc::Lock::new(mvcc::LockType::Put, b"k".to_vec(), 10, 20, None),
+                start_ts: 10,
+                ttl: 10,
             },
             Command::Cleanup {
                 ctx: Context::new(),

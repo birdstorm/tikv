@@ -136,9 +136,9 @@ pub enum Command {
     },
     RefreshLock {
         ctx: Context,
-        txn_status: HashMap<u64, u64>,
         key: Key,
         start_ts: u64,
+        ttl: u64,
     },
     DeleteRange {
         ctx: Context,
@@ -311,11 +311,11 @@ impl Command {
             Command::Prewrite { start_ts, .. }
             | Command::Cleanup { start_ts, .. }
             | Command::Rollback { start_ts, .. }
-            | Command::MvccByStartTs { start_ts, .. } => start_ts,
+            | Command::MvccByStartTs { start_ts, .. }
+            | Command::RefreshLock { start_ts, .. } => start_ts,
             Command::Commit { lock_ts, .. } => lock_ts,
             Command::ScanLock { max_ts, .. } => max_ts,
             Command::ResolveLock { .. }
-            | Command::RefreshLock { .. }
             | Command::DeleteRange { .. }
             | Command::Pause { .. }
             | Command::MvccByKey { .. } => 0,
@@ -886,16 +886,16 @@ impl<E: Engine> Storage<E> {
     pub fn async_refresh_lock(
         &self,
         ctx: Context,
-        txn_status: HashMap<u64, u64>,
         key: Vec<u8>,
         start_ts: u64,
+        ttl: u64,
         callback: Callback<()>,
     ) -> Result<()> {
         let cmd = Command::RefreshLock {
             ctx,
-            txn_status,
             key: Key::from_raw(&key),
             start_ts,
+            ttl,
         };
         let tag = cmd.tag();
         self.schedule(cmd, StorageCb::Boolean(callback))?;
