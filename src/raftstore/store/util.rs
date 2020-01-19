@@ -281,29 +281,37 @@ pub fn check_region_epoch(
     }
 
     let from_epoch = req.get_header().get_region_epoch();
-    let latest_epoch = region.get_region_epoch();
+    let current_epoch = region.get_region_epoch();
 
-    // should we use not equal here?
-    if (check_conf_ver && from_epoch.get_conf_ver() < latest_epoch.get_conf_ver())
-        || (check_ver && from_epoch.get_version() < latest_epoch.get_version())
+    // We must check epochs strictly to avoid key not in region error.
+    //
+    // A 3 nodes TiKV cluster with merge enabled, after commit merge, TiKV A
+    // tells TiDB with a epoch not match error contains the latest target Region
+    // info, TiDB updates its region cache and sends requests to TiKV B,
+    // and TiKV B has not applied commit merge yet, since the region epoch in
+    // request is higher than TiKV B, the request must be denied due to epoch
+    // not match, so it does not read on a stale snapshot, thus avoid the
+    // KeyNotInRegion error.
+    if (check_conf_ver && from_epoch.get_conf_ver() != current_epoch.get_conf_ver())
+        || (check_ver && from_epoch.get_version() != current_epoch.get_version())
     {
         debug!(
-            "[region {}] received stale epoch {:?}, mine: {:?}",
+            "[region {}] received epoch not match {:?}, mine: {:?}",
             region.get_id(),
             from_epoch,
-            latest_epoch
+            current_epoch
         );
         let regions = if include_region {
             vec![region.to_owned()]
         } else {
             vec![]
         };
-        return Err(Error::StaleEpoch(
+        return Err(Error::EpochNotMatch(
             format!(
-                "latest_epoch of region {} is {:?}, but you \
+                "current epoch of region {} is {:?}, but you \
                  sent {:?}",
                 region.get_id(),
-                latest_epoch,
+                current_epoch,
                 from_epoch
             ),
             regions,
@@ -319,6 +327,11 @@ pub fn check_store_id(req: &RaftCmdRequest, store_id: u64) -> Result<()> {
     if peer.get_store_id() == store_id {
         Ok(())
     } else {
+        error!(
+            "[store {}] mismatch store id {}",
+            store_id,
+            peer.get_store_id()
+        );
         Err(Error::StoreNotMatch(peer.get_store_id(), store_id))
     }
 }
@@ -394,9 +407,9 @@ pub fn get_region_approximate_size_cf(
 pub fn get_region_approximate_keys(db: &DB, region: &metapb::Region) -> Result<u64> {
     // try to get from RangeProperties first.
     match get_region_approximate_keys_cf(db, CF_WRITE, region) {
-        Ok(v) => if v > 0 {
+        Ok(v) => {
             return Ok(v);
-        },
+        }
         Err(e) => debug!(
             "old_version:get keys from RangeProperties failed with err:{:?}",
             e
@@ -1328,8 +1341,8 @@ mod tests {
         let db_opts = DBOptions::new();
         let mut cf_opts = ColumnFamilyOptions::new();
         cf_opts.set_level_zero_file_num_compaction_trigger(10);
-        let f = Box::new(MvccPropertiesCollectorFactory::default());
-        cf_opts.add_table_properties_collector_factory("tikv.mvcc-properties-collector", f);
+        let f = Box::new(RangePropertiesCollectorFactory::default());
+        cf_opts.add_table_properties_collector_factory("tikv.range-properties-collector", f);
         let cfs_opts = LARGE_CFS
             .iter()
             .map(|cf| CFOptions::new(cf, cf_opts.clone()))
@@ -1353,6 +1366,51 @@ mod tests {
         let region = make_region(1, vec![], vec![]);
         let region_keys = get_region_approximate_keys(&db, &region).unwrap();
         assert_eq!(region_keys, cases.len() as u64);
+    }
+
+    #[test]
+    fn test_region_approximate_keys_sub_region() {
+        let path = TempDir::new("_test_region_approximate_keys_sub_region").expect("");
+        let path_str = path.path().to_str().unwrap();
+        let db_opts = DBOptions::new();
+        let mut cf_opts = ColumnFamilyOptions::new();
+        cf_opts.set_level_zero_file_num_compaction_trigger(10);
+        let f = Box::new(MvccPropertiesCollectorFactory::default());
+        cf_opts.add_table_properties_collector_factory("tikv.mvcc-properties-collector", f);
+        let f = Box::new(RangePropertiesCollectorFactory::default());
+        cf_opts.add_table_properties_collector_factory("tikv.range-properties-collector", f);
+        let cfs_opts = LARGE_CFS
+            .iter()
+            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
+            .collect();
+        let db = rocksdb_util::new_engine_opt(path_str, db_opts, cfs_opts).unwrap();
+
+        let write_cf = db.cf_handle(CF_WRITE).unwrap();
+        let default_cf = db.cf_handle(CF_DEFAULT).unwrap();
+        // size >= 4194304 will insert a new point in range properties
+        // 3 points will be inserted into range properties
+        let cases = [("a", 4194304), ("b", 4194304), ("c", 4194304)];
+        for &(key, vlen) in &cases {
+            let key = keys::data_key(Key::from_raw(key.as_bytes()).append_ts(2).as_encoded());
+            let write_v = Write::new(WriteType::Put, 0, None).to_bytes();
+            db.put_cf(write_cf, &key, &write_v).unwrap();
+
+            let default_v = vec![0; vlen as usize];
+            db.put_cf(default_cf, &key, &default_v).unwrap();
+        }
+        // only flush once, so that mvcc properties will insert one point only
+        db.flush_cf(write_cf, true).unwrap();
+        db.flush_cf(default_cf, true).unwrap();
+
+        // range properties get 0, mvcc properties get 3
+        let region = make_region(1, b"b1".to_vec(), b"b2".to_vec());
+        let range_keys = get_region_approximate_keys(&db, &region).unwrap();
+        assert_eq!(range_keys, 0);
+
+        // range properties get 1, mvcc properties get 3
+        let region = make_region(1, b"a".to_vec(), b"c".to_vec());
+        let range_keys = get_region_approximate_keys(&db, &region).unwrap();
+        assert_eq!(range_keys, 1);
     }
 
     #[test]
@@ -1390,6 +1448,43 @@ mod tests {
             let size = get_region_approximate_size_cf(&db, cfname, &region).unwrap();
             assert_eq!(size, cf_size);
         }
+    }
+
+    #[test]
+    fn test_region_maybe_inaccurate_approximate_size() {
+        let path =
+            TempDir::new("_test_raftstore_region_maybe_inaccurate_approximate_size").expect("");
+        let path_str = path.path().to_str().unwrap();
+        let db_opts = DBOptions::new();
+        let mut cf_opts = ColumnFamilyOptions::new();
+        cf_opts.set_disable_auto_compactions(true);
+        let f = Box::new(RangePropertiesCollectorFactory::default());
+        cf_opts.add_table_properties_collector_factory("tikv.range-collector", f);
+        let cfs_opts = LARGE_CFS
+            .iter()
+            .map(|cf| CFOptions::new(cf, cf_opts.clone()))
+            .collect();
+        let db = rocksdb_util::new_engine_opt(path_str, db_opts, cfs_opts).unwrap();
+
+        let mut cf_size = 0;
+        for i in 0..100 {
+            let k1 = keys::data_key(format!("k1{}", i).as_bytes());
+            let k2 = keys::data_key(format!("k9{}", i).as_bytes());
+            let v = vec![0; 4096];
+            cf_size += k1.len() + k2.len() + v.len() * 2;
+            let cf = db.cf_handle("default").unwrap();
+            db.put_cf(cf, &k1, &v).unwrap();
+            db.put_cf(cf, &k2, &v).unwrap();
+            db.flush_cf(cf, true).unwrap();
+        }
+
+        let region = make_region(1, vec![], vec![]);
+        let size = get_region_approximate_size(&db, &region).unwrap();
+        assert_eq!(size, cf_size as u64);
+
+        let region = make_region(1, b"k2".to_vec(), b"k8".to_vec());
+        let size = get_region_approximate_size(&db, &region).unwrap();
+        assert_eq!(size, 0);
     }
 
     fn check_data(db: &DB, cfs: &[&str], expected: &[(&[u8], &[u8])]) {
@@ -1692,8 +1787,14 @@ mod tests {
             req.mut_header()
                 .set_region_epoch(stale_version_epoch.clone());
             check_region_epoch(&req, &stale_region, false).unwrap();
-            check_region_epoch(&req, &region, false).unwrap_err();
-            check_region_epoch(&req, &region, true).unwrap_err();
+
+            let mut latest_version_epoch = epoch.clone();
+            latest_version_epoch.set_version(3);
+            for epoch in &[stale_version_epoch, latest_version_epoch] {
+                req.mut_header().set_region_epoch(epoch.clone());
+                check_region_epoch(&req, &region, false).unwrap_err();
+                check_region_epoch(&req, &region, true).unwrap_err();
+            }
         }
 
         // These admin commands requires epoch.conf_version.
@@ -1720,8 +1821,14 @@ mod tests {
             stale_region.set_region_epoch(stale_conf_epoch.clone());
             req.mut_header().set_region_epoch(stale_conf_epoch.clone());
             check_region_epoch(&req, &stale_region, false).unwrap();
-            check_region_epoch(&req, &region, false).unwrap_err();
-            check_region_epoch(&req, &region, true).unwrap_err();
+
+            let mut latest_conf_epoch = epoch.clone();
+            latest_conf_epoch.set_conf_ver(3);
+            for epoch in &[stale_conf_epoch, latest_conf_epoch] {
+                req.mut_header().set_region_epoch(epoch.clone());
+                check_region_epoch(&req, &region, false).unwrap_err();
+                check_region_epoch(&req, &region, true).unwrap_err();
+            }
         }
     }
 

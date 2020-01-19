@@ -85,6 +85,10 @@ impl Deadline {
 
     /// Returns error if the deadline is exceeded.
     pub fn check_if_exceeded(&self) -> Result<()> {
+        fail_point!("coprocessor_deadline_check_exceeded", |_| Err(
+            Error::Outdated(Duration::from_secs(60), self.tag)
+        ));
+
         let now = Instant::now_coarse();
         if self.deadline <= now {
             let elapsed = now.duration_since(self.start_time);
@@ -125,6 +129,9 @@ pub struct ReqContext {
 
     /// The transaction start_ts of the request
     pub txn_start_ts: Option<u64>,
+
+    /// The priority of the request
+    pub priority: &'static str,
 }
 
 impl ReqContext {
@@ -138,8 +145,14 @@ impl ReqContext {
         txn_start_ts: Option<u64>,
     ) -> Self {
         let deadline = Deadline::from_now(tag, max_handle_duration);
+        let priority = match context.priority {
+            kvrpcpb::CommandPri::Normal => "normal",
+            kvrpcpb::CommandPri::High => "high",
+            kvrpcpb::CommandPri::Low => "low",
+        };
         Self {
             tag,
+            priority,
             context,
             deadline,
             peer,

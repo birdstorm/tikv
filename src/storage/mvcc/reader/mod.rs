@@ -22,6 +22,7 @@ use kvproto::kvrpcpb::IsolationLevel;
 use raftstore::store::engine::IterOption;
 use std::u64;
 use storage::engine::{Cursor, ScanMode, Snapshot, Statistics};
+use storage::mvcc::default_not_found_error;
 use storage::{Key, Value, CF_LOCK, CF_WRITE};
 use util::properties::MvccProperties;
 
@@ -84,9 +85,9 @@ impl<S: Snapshot> MvccReader<S> {
         self.key_only = key_only;
     }
 
-    pub fn load_data(&mut self, key: &Key, ts: u64) -> Result<Value> {
+    pub fn load_data(&mut self, key: &Key, ts: u64) -> Result<Option<Value>> {
         if self.key_only {
-            return Ok(vec![]);
+            return Ok(Some(vec![]));
         }
         if self.scan_mode.is_some() && self.data_cursor.is_none() {
             let iter_opt = IterOption::new(None, None, self.fill_cache);
@@ -95,16 +96,12 @@ impl<S: Snapshot> MvccReader<S> {
 
         let k = key.clone().append_ts(ts);
         let res = if let Some(ref mut cursor) = self.data_cursor {
-            match cursor.get(&k, &mut self.statistics.data)? {
-                None => panic!("key {} not found, ts {}", key, ts),
-                Some(v) => v.to_vec(),
-            }
+            cursor
+                .get(&k, &mut self.statistics.data)?
+                .map(|v| v.to_vec())
         } else {
             self.statistics.data.get += 1;
-            match self.snapshot.get(&k)? {
-                None => panic!("key {} not found, ts: {}", key, ts),
-                Some(v) => v,
-            }
+            self.snapshot.get(&k)?
         };
 
         self.statistics.data.processed += 1;
@@ -225,6 +222,7 @@ impl<S: Snapshot> MvccReader<S> {
             primary: lock.primary,
             ts: lock.ts,
             ttl: lock.ttl,
+            txn_size: lock.txn_size,
         })
     }
 
@@ -244,7 +242,12 @@ impl<S: Snapshot> MvccReader<S> {
                             }
                             return Ok(write.short_value.take());
                         }
-                        return self.load_data(key, write.start_ts).map(Some);
+                        match self.load_data(key, write.start_ts)? {
+                            None => {
+                                return Err(default_not_found_error(key.to_raw()?, write, "get"));
+                            }
+                            Some(v) => return Ok(Some(v)),
+                        }
                     }
                     WriteType::Delete => {
                         return Ok(None);
@@ -261,19 +264,16 @@ impl<S: Snapshot> MvccReader<S> {
         key: &Key,
         start_ts: u64,
     ) -> Result<Option<(u64, WriteType)>> {
-        let mut seek_ts = start_ts;
-        while let Some((commit_ts, write)) = self.reverse_seek_write(key, seek_ts)? {
+        let mut seek_ts = u64::max_value();
+        while let Some((commit_ts, write)) = self.seek_write(key, seek_ts)? {
             if write.start_ts == start_ts {
                 return Ok(Some((commit_ts, write.write_type)));
             }
 
-            // If we reach a commit version whose type is not Rollback and start ts is
-            // larger than the given start ts, stop searching.
-            if write.write_type != WriteType::Rollback && write.start_ts > start_ts {
+            if commit_ts <= start_ts {
                 break;
             }
-
-            seek_ts = commit_ts + 1;
+            seek_ts = commit_ts - 1;
         }
         Ok(None)
     }
@@ -362,7 +362,7 @@ impl<S: Snapshot> MvccReader<S> {
             return Ok((vec![], false));
         }
         let mut locks = Vec::with_capacity(limit);
-        while cursor.valid() {
+        while cursor.valid()? {
             let key = Key::from_encoded_slice(cursor.key(&mut self.statistics.lock));
             let lock = Lock::parse(cursor.value(&mut self.statistics.lock))?;
             if filter(&lock) {
@@ -802,11 +802,11 @@ mod tests {
         assert_eq!(commit_ts, 5);
         assert_eq!(write_type, WriteType::Rollback);
 
-        let seek_for_prev_old = reader.get_statistics().write.seek_for_prev;
-        assert!(reader.get_txn_commit_info(&key, 15).unwrap().is_none());
-        let seek_for_prev_new = reader.get_statistics().write.seek_for_prev;
+        let seek_old = reader.get_statistics().write.seek;
+        assert!(reader.get_txn_commit_info(&key, 30).unwrap().is_none());
+        let seek_new = reader.get_statistics().write.seek;
 
         // `get_txn_commit_info(&key, 15)` stopped at `30_25 PUT`.
-        assert_eq!(seek_for_prev_new - seek_for_prev_old, 2);
+        assert_eq!(seek_new - seek_old, 2);
     }
 }

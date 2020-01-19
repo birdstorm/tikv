@@ -19,7 +19,7 @@ use chrono;
 use clap::ArgMatches;
 use slog_scope::GlobalLoggerGuard;
 
-use tikv::config::{MetricConfig, TiKvConfig};
+use tikv::config::{check_critical_config, persist_critical_config, MetricConfig, TiKvConfig};
 use tikv::server::config::{DEFAULT_ENGINE_LABEL_KEY, DEFAULT_ENGINE_LABEL_VALUE};
 use tikv::util::collections::HashMap;
 use tikv::util::{self, logger};
@@ -69,6 +69,9 @@ pub fn initial_logger(config: &TiKvConfig) -> GlobalLoggerGuard {
 
 #[allow(dead_code)]
 pub fn initial_metric(cfg: &MetricConfig, node_id: Option<u64>) {
+    util::metrics::monitor_threads("tikv")
+        .unwrap_or_else(|e| fatal!("failed to start monitor thread: {:?}", e));
+
     if cfg.interval.as_secs() == 0 || cfg.address.is_empty() {
         return;
     }
@@ -79,10 +82,6 @@ pub fn initial_metric(cfg: &MetricConfig, node_id: Option<u64>) {
     }
 
     info!("start prometheus client");
-
-    util::metrics::monitor_threads("tikv")
-        .unwrap_or_else(|e| fatal!("failed to start monitor thread: {:?}", e));
-
     util::metrics::run_prometheus(cfg.interval.0, &cfg.address, &push_job);
 }
 
@@ -102,6 +101,10 @@ pub fn overwrite_config_with_cmd_args(config: &mut TiKvConfig, matches: &ArgMatc
 
     if let Some(advertise_addr) = matches.value_of("advertise-addr") {
         config.server.advertise_addr = advertise_addr.to_owned();
+    }
+
+    if let Some(status_addr) = matches.value_of("status-addr") {
+        config.server.status_addr = status_addr.to_owned();
     }
 
     if let Some(data_dir) = matches.value_of("data-dir") {
@@ -175,5 +178,23 @@ pub fn check_environment_variables() {
         if let Ok(var) = env::var(proxy) {
             info!("environment variable `{}` is present, `{}`", proxy, var);
         }
+    }
+}
+
+#[allow(dead_code)]
+pub fn validate_and_persist_config(config: &mut TiKvConfig, persist: bool) {
+    if let Err(e) = check_critical_config(config) {
+        fatal!("critical config check failed: {}", e);
+    }
+
+    if persist {
+        if let Err(e) = persist_critical_config(&config) {
+            fatal!("persist critical config failed: {}", e);
+        }
+    }
+
+    config.compatible_adjust();
+    if let Err(e) = config.validate() {
+        fatal!("invalid configuration: {}", e.description());
     }
 }

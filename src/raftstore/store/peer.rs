@@ -285,7 +285,7 @@ pub struct Peer {
     /// Record the instants of peers being added into the configuration.
     /// Remove them after they are not pending any more.
     pub peers_start_pending_time: Vec<(u64, Instant)>,
-    pub recent_added_peer: RecentAddedPeer,
+    pub recent_conf_change_time: Instant,
 
     coprocessor_host: Arc<CoprocessorHost>,
     /// an inaccurate difference in region size since last reset.
@@ -435,9 +435,7 @@ impl Peer {
             peer_cache: RefCell::new(HashMap::default()),
             peer_heartbeats: HashMap::default(),
             peers_start_pending_time: vec![],
-            recent_added_peer: RecentAddedPeer::new(
-                cfg.raft_reject_transfer_leader_duration.as_secs(),
-            ),
+            recent_conf_change_time: Instant::now(),
             coprocessor_host: Arc::clone(&store.coprocessor_host),
             size_diff_hint: 0,
             delete_keys_hint: 0,
@@ -949,37 +947,11 @@ impl Peer {
         Some(region_proposal)
     }
 
-    pub fn handle_raft_ready_append<T: Transport>(
-        &mut self,
-        ctx: &mut ReadyContext<T>,
-        worker: &FutureWorker<PdTask>,
+    pub fn check_pending_snapshot(
+        &self,
         region_ranges: &BTreeMap<Vec<u8>, u64>,
         region_peers: &HashMap<u64, Peer>,
-    ) {
-        self.marked_to_be_checked = false;
-        if self.pending_remove {
-            return;
-        }
-        if self.mut_store().check_applying_snap() {
-            // If we continue to handle all the messages, it may cause too many messages because
-            // leader will send all the remaining messages to this follower, which can lead
-            // to full message queue under high load.
-            debug!(
-                "{} still applying snapshot, skip further handling.",
-                self.tag
-            );
-            return;
-        }
-
-        if !self.pending_messages.is_empty() {
-            fail_point!("raft_before_follower_send");
-            let messages = mem::replace(&mut self.pending_messages, vec![]);
-            self.send(ctx.trans, messages, &mut ctx.metrics.message)
-                .unwrap_or_else(|e| {
-                    warn!("{} clear snapshot pending messages err {:?}", self.tag, e);
-                });
-        }
-
+    ) -> bool {
         if let Some(snap) = self.get_pending_snapshot() {
             if !self.ready_to_handle_pending_snap() {
                 debug!(
@@ -988,8 +960,7 @@ impl Peer {
                     self.get_store().applied_index(),
                     self.last_applying_idx,
                 );
-                ctx.pending_sync_region.push(self.region_id);
-                return;
+                return false;
             }
 
             let mut snap_data = RaftSnapshotData::new();
@@ -1015,8 +986,44 @@ impl Peer {
                     self.last_applying_idx,
                     r,
                 );
-                return;
+                return false;
             }
+        }
+        true
+    }
+
+    pub fn handle_raft_ready_append<T: Transport>(
+        &mut self,
+        ctx: &mut ReadyContext<T>,
+        worker: &FutureWorker<PdTask>,
+        check_pending_snapshot: bool,
+    ) {
+        self.marked_to_be_checked = false;
+        if self.pending_remove {
+            return;
+        }
+        if self.mut_store().check_applying_snap() {
+            // If we continue to handle all the messages, it may cause too many messages because
+            // leader will send all the remaining messages to this follower, which can lead
+            // to full message queue under high load.
+            debug!(
+                "{} still applying snapshot, skip further handling.",
+                self.tag
+            );
+            return;
+        }
+
+        if !self.pending_messages.is_empty() {
+            fail_point!("raft_before_follower_send");
+            let messages = mem::replace(&mut self.pending_messages, vec![]);
+            self.send(ctx.trans, messages, &mut ctx.metrics.message)
+                .unwrap_or_else(|e| {
+                    warn!("{} clear snapshot pending messages err {:?}", self.tag, e);
+                });
+        }
+
+        if !check_pending_snapshot {
+            return;
         }
 
         if !self
@@ -1518,8 +1525,11 @@ impl Peer {
     fn post_propose(&mut self, mut meta: ProposalMeta, is_conf_change: bool, cb: Callback) {
         // Try to renew leader lease on every consistent read/write request.
         meta.renew_lease_time = Some(monotonic_raw_now());
-        let p = Proposal::new(is_conf_change, meta.index, meta.term, cb);
-        self.apply_proposals.push(p);
+
+        if !cb.is_none() {
+            let p = Proposal::new(is_conf_change, meta.index, meta.term, cb);
+            self.apply_proposals.push(p);
+        }
 
         self.proposals.push(meta);
     }
@@ -1666,6 +1676,20 @@ impl Peer {
             return false;
         }
 
+        // Checks if safe to transfer leader.
+        // Check `has_pending_conf` is necessary because `recent_conf_change_time` is updated
+        // on applied. TODO: fix the transfer leader issue in Raft.
+        if self.raft_group.raft.has_pending_conf()
+            || duration_to_sec(self.recent_conf_change_time.elapsed())
+                < self.cfg.raft_reject_transfer_leader_duration.as_secs() as f64
+        {
+            debug!(
+                "{} reject transfer leader to {:?} due to the region was config changed recently",
+                self.tag, peer
+            );
+            return false;
+        }
+
         let last_index = self.get_store().last_index();
         last_index <= status.progress[&peer_id].matched + self.cfg.leader_transfer_max_log_lag
     }
@@ -1715,14 +1739,25 @@ impl Peer {
         metrics.read_index += 1;
 
         let renew_lease_time = monotonic_raw_now();
-        if self.is_leader() {
-            if let Some(read) = self.pending_reads.reads.back_mut() {
-                if read.renew_lease_time + self.cfg.raft_store_max_leader_lease() > renew_lease_time
-                {
-                    read.cmds.push((req, cb));
-                    return false;
+        match self.inspect_lease() {
+            // Here combine the new read request with the previous one even if the lease expired is
+            // ok because in this case, the previous read index must be sent out with a valid
+            // lease instead of a suspect lease. So there must no pending transfer-leader proposals
+            // before or after the previous read index, and the lease can be renewed when get
+            // heartbeat responses.
+            LeaseState::Valid | LeaseState::Expired => {
+                if let Some(read) = self.pending_reads.reads.back_mut() {
+                    let max_lease = self.cfg.raft_store_max_leader_lease();
+                    if read.renew_lease_time + max_lease > renew_lease_time {
+                        read.cmds.push((req, cb));
+                        return false;
+                    }
                 }
             }
+            // If the current lease is suspect, new read requests can't be appended into
+            // `pending_reads` because if the leader is transfered, the latest read could
+            // be dirty.
+            _ => {}
         }
 
         // Should we call pre_propose here?
@@ -1810,22 +1845,32 @@ impl Peer {
             }
             let cmd: RaftCmdRequest =
                 util::parse_data_at(entry.get_data(), entry.get_index(), &self.tag);
-            if !cmd.has_admin_request() {
-                continue;
+            if cmd.has_admin_request() {
+                let cmd_type = cmd.get_admin_request().get_cmd_type();
+                match cmd_type {
+                    AdminCmdType::TransferLeader
+                    | AdminCmdType::VerifyHash
+                    | AdminCmdType::InvalidAdmin => {}
+                    _ => {
+                        // Any command that can change epoch or log gap should be rejected.
+                        return Err(box_err!(
+                            "log gap contains admin request {:?}, skip merging.",
+                            cmd_type
+                        ));
+                    }
+                }
             }
-            let cmd_type = cmd.get_admin_request().get_cmd_type();
-            match cmd_type {
-                AdminCmdType::TransferLeader
-                | AdminCmdType::ComputeHash
-                | AdminCmdType::VerifyHash
-                | AdminCmdType::InvalidAdmin => continue,
-                _ => {}
+            // Make sure the tombstone state and apply state of source region are in a same batch
+            // when catching up logs, if not the last_index would smaller than applied index after
+            // restart. So rejecting the requests that would flush apply state.
+            for req in cmd.get_requests() {
+                if req.has_delete_range() {
+                    return Err(box_err!("log gap contains delete range, skip merging."));
+                }
+                if req.has_ingest_sst() {
+                    return Err(box_err!("log gap contains ingest sst, skip merging."));
+                }
             }
-            // Any command that can change epoch or log gap should be rejected.
-            return Err(box_err!(
-                "log gap contains admin request {:?}, skip merging.",
-                cmd_type
-            ));
         }
         if entry_size as f64 > self.cfg.raft_entry_max_size.0 as f64 * 0.9 {
             return Err(box_err!(
@@ -2322,7 +2367,7 @@ impl ReadExecutor {
         );
         if self.check_epoch {
             if let Err(e) = check_region_epoch(msg, region, true) {
-                debug!("[region {}] stale epoch err: {:?}", region.get_id(), e);
+                debug!("[region {}] epoch not match err: {:?}", region.get_id(), e);
                 return ReadResponse {
                     response: cmd_resp::new_error(e),
                     snapshot: None,

@@ -40,6 +40,10 @@ impl Server<Service> {
         let case = Option::None::<Arc<Service>>;
         Self::with_configuration(&mgr, eps, case)
     }
+
+    pub fn default_handler(&self) -> &Service {
+        &self.mocker.default_handler
+    }
 }
 
 impl<C: PdMocker + Send + Sync + 'static> Server<C> {
@@ -366,11 +370,11 @@ impl<C: PdMocker + Send + Sync + 'static> Pd for PdMock<C> {
         unimplemented!()
     }
 
-    fn sync_regions(
+    fn get_operator(
         &mut self,
-        _ctx: RpcContext,
-        _stream: RequestStream<SyncRegionRequest>,
-        _sink: DuplexSink<SyncRegionResponse>,
+        _ctx: RpcContext<'_>,
+        _stream: GetOperatorRequest,
+        _sink: UnarySink<GetOperatorResponse>,
     ) {
         unimplemented!()
     }

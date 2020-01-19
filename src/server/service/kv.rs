@@ -179,6 +179,7 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         let mut options = Options::default();
         options.lock_ttl = req.get_lock_ttl();
         options.skip_constraint_check = req.get_skip_constraint_check();
+        options.txn_size = req.get_txn_size();
 
         let (cb, f) = paired_future_callback();
         let res = self.storage.async_prewrite(
@@ -413,6 +414,11 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_resolve_lock.start_coarse_timer();
 
+        let resolve_keys: Vec<Key> = req
+            .get_keys()
+            .iter()
+            .map(|key| Key::from_raw(key))
+            .collect();
         let txn_status = if req.get_start_version() > 0 {
             HashMap::from_iter(iter::once((
                 req.get_start_version(),
@@ -427,9 +433,21 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         };
 
         let (cb, f) = paired_future_callback();
-        let res = self
-            .storage
-            .async_resolve_lock(req.take_context(), txn_status, cb);
+        let res = if !resolve_keys.is_empty() {
+            let start_ts = req.get_start_version();
+            assert!(start_ts > 0);
+            let commit_ts = req.get_commit_version();
+            self.storage.async_resolve_lock_lite(
+                req.take_context(),
+                start_ts,
+                commit_ts,
+                resolve_keys,
+                cb,
+            )
+        } else {
+            self.storage
+                .async_resolve_lock(req.take_context(), txn_status, cb)
+        };
 
         let future = AndThenWith::new(res, f.map_err(Error::from))
             .and_then(|v| {
@@ -575,12 +593,7 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         ctx.spawn(future);
     }
 
-    fn raw_put(
-        &mut self,
-        ctx: RpcContext,
-        mut req: RawPutRequest,
-        sink: UnarySink<RawPutResponse>,
-    ) {
+    fn raw_put(&mut self, ctx: RpcContext, mut req: RawPutRequest, sink: UnarySink<RawPutResponse>) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.raw_put.start_coarse_timer();
 
         let (cb, f) = paired_future_callback();
@@ -1189,6 +1202,13 @@ fn extract_region_error<T>(res: &storage::Result<T>) -> Option<RegionError> {
             err.set_server_is_busy(server_is_busy_err);
             Some(err)
         }
+        Err(Error::Closed) => {
+            // TiKV is closing, return an RegionError to tell the client that this region is unavailable
+            // temporarily, the client should retry the request in other TiKVs.
+            let mut err = RegionError::new();
+            err.set_message("TiKV is Closing".to_string());
+            Some(err)
+        }
         _ => None,
     }
 }
@@ -1208,12 +1228,14 @@ fn extract_key_error(err: &storage::Error) -> KeyError {
             ref primary,
             ts,
             ttl,
+            txn_size,
         })) => {
             let mut lock_info = LockInfo::new();
             lock_info.set_key(key.to_owned());
             lock_info.set_primary_lock(primary.to_owned());
             lock_info.set_lock_version(ts);
             lock_info.set_lock_ttl(ttl);
+            lock_info.set_txn_size(txn_size);
             key_error.set_locked(lock_info);
         }
         // failed in prewrite

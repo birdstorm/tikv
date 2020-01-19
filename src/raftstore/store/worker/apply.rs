@@ -18,6 +18,7 @@ use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::u64;
 
 use futures::sync::mpsc::UnboundedSender;
 use grpc::WriteFlags;
@@ -108,14 +109,14 @@ pub struct PendingCmdQueue {
 }
 
 impl PendingCmdQueue {
-    fn pop_normal(&mut self, term: u64) -> Option<PendingCmd> {
+    fn pop_normal(&mut self, index: u64, term: u64) -> Option<PendingCmd> {
         self.normals.pop_front().and_then(|cmd| {
             if self.normals.capacity() > SHRINK_PENDING_CMD_QUEUE_CAP
                 && self.normals.len() < SHRINK_PENDING_CMD_QUEUE_CAP
             {
                 self.normals.shrink_to_fit();
             }
-            if cmd.term > term {
+            if (cmd.term, cmd.index) > (term, index) {
                 self.normals.push_front(cmd);
                 return None;
             }
@@ -234,6 +235,7 @@ struct Stash {
     region: Option<Region>,
     exec_ctx: Option<ExecContext>,
     last_applied_index: u64,
+    for_merge_source: bool,
 }
 
 #[allow(dead_code)]
@@ -260,6 +262,8 @@ struct ApplyContextCore<'a> {
     command_context: Option<Vec<u8>>,
 
     pending_destroy_tasks: Vec<Destroy>,
+    // indicates it is catching up logs for merge.
+    for_merge_source: bool,
 }
 
 impl<'a> ApplyContextCore<'a> {
@@ -282,6 +286,7 @@ impl<'a> ApplyContextCore<'a> {
             use_delete_range: false,
             command_context: None,
             pending_destroy_tasks: vec![],
+            for_merge_source: false,
         }
     }
 
@@ -388,13 +393,16 @@ impl<'a> ApplyContextCore<'a> {
     /// the context is ready to switch to apply other `ApplyDelegate`.
     pub fn stash(&mut self, delegate: &mut ApplyDelegate) -> Stash {
         self.commit_opt(delegate, false);
-        Stash {
+        let stash = Stash {
             // last cbs should not be popped, because if the ApplyContext
             // is flushed, the callbacks can be flushed too.
             region: self.cbs.last().map(|cbs| cbs.region.clone()),
             exec_ctx: self.exec_ctx.take(),
             last_applied_index: self.last_applied_index,
-        }
+            for_merge_source: self.for_merge_source,
+        };
+        self.for_merge_source = true;
+        stash
     }
 
     /// Restore the dirty state, so context can resume applying from
@@ -403,6 +411,7 @@ impl<'a> ApplyContextCore<'a> {
         if let Some(region) = stash.region {
             self.cbs.push(ApplyCallback::new(region));
         }
+        self.for_merge_source = stash.for_merge_source;
         self.exec_ctx = stash.exec_ctx;
         self.last_applied_index = stash.last_applied_index;
     }
@@ -489,7 +498,7 @@ pub fn notify_stale_req(term: u64, cb: Callback) {
 
 /// Check if a write is needed to be issued before handle the command.
 #[allow(dead_code)]
-fn should_write_to_engine(cmd: &RaftCmdRequest, wb_keys: usize) -> bool {
+fn should_write_to_engine(cmd: &RaftCmdRequest, wb_keys: usize, for_merge_source: bool) -> bool {
     if cmd.has_admin_request() {
         match cmd.get_admin_request().get_cmd_type() {
             // ComputeHash require an up to date snapshot.
@@ -502,7 +511,7 @@ fn should_write_to_engine(cmd: &RaftCmdRequest, wb_keys: usize) -> bool {
     }
 
     // When write batch contains more than `recommended` keys, write the batch to engine.
-    if wb_keys >= WRITE_BATCH_MAX_KEYS {
+    if wb_keys >= WRITE_BATCH_MAX_KEYS && !for_merge_source {
         return true;
     }
 
@@ -642,7 +651,7 @@ impl ApplyDelegate {
             apply_state: reg.apply_state,
             applied_index_term: reg.applied_index_term,
             term: reg.term,
-            is_merging: false,
+            is_merging: reg.is_merging,
             pending_cmds: Default::default(),
             metrics: Default::default(),
             last_merge_version: 0,
@@ -756,7 +765,7 @@ impl ApplyDelegate {
             // TODO: uncomment it, maybe we need send an extra request
             //       ask engine server to persist its apply results.
             //
-            // if should_write_to_engine(&cmd, apply_ctx.wb().count()) {
+            // if should_write_to_engine(&cmd, apply_ctx.wb().count(), apply_ctx.for_merge_source) {
             //     apply_ctx.commit(self);
             // }
 
@@ -771,8 +780,12 @@ impl ApplyDelegate {
         // self.apply_state = state;
         // self.applied_index_term = term;
         assert!(term > 0);
-        while let Some(mut cmd) = self.pending_cmds.pop_normal(term - 1) {
-            // apparently, all the callbacks whose term is less than entry's term are stale.
+
+        // 1. When a peer become leader, it will send an empty entry.
+        // 2. When a leader tries to read index during transferring leader,
+        //    it will also propose an empty entry. But that entry will not contain
+        //    any associated callback. So no need to clear callback.
+        while let Some(mut cmd) = self.pending_cmds.pop_normal(u64::MAX, term - 1) {
             apply_ctx
                 .cbs
                 .last_mut()
@@ -848,13 +861,21 @@ impl ApplyDelegate {
             }
             return None;
         }
-        while let Some(mut head) = self.pending_cmds.pop_normal(term) {
-            if head.index == index && head.term == term {
-                return Some(head.cb.take().unwrap());
+        while let Some(mut head) = self.pending_cmds.pop_normal(index, term) {
+            if head.term == term {
+                if head.index == index {
+                    return Some(head.cb.take().unwrap());
+                } else {
+                    panic!(
+                        "{} unexpected callback at term {}, found index {}, expected {}",
+                        self.tag, term, head.index, index
+                    );
+                }
+            } else {
+                // Because of the lack of original RaftCmdRequest, we skip calling
+                // coprocessor here.
+                notify_stale_command(&self.tag, self.term, head);
             }
-            // Because of the lack of original RaftCmdRequest, we skip calling
-            // coprocessor here.
-            notify_stale_command(&self.tag, self.term, head);
         }
         None
     }
@@ -891,7 +912,7 @@ impl ApplyDelegate {
 
     // apply operation can fail as following situation:
     //   1. encounter an error that will occur on all store, it can continue
-    // applying next entry safely, like stale epoch for example;
+    // applying next entry safely, like epoch not match for example;
     //   2. encounter an error that may not occur on all store, in this case
     // we should try to apply the entry again or panic. Considering that this
     // usually due to disk operation fail, which is rare, so just panic is ok.
@@ -913,7 +934,7 @@ impl ApplyDelegate {
             ctx.wb_mut().rollback_to_save_point().unwrap();
             success = false;
             match e {
-                Error::StaleEpoch(..) => debug!("{} stale epoch err: {:?}", self.tag, e),
+                Error::EpochNotMatch(..) => debug!("{} epoch not match err: {:?}", self.tag, e),
                 _ => panic!("{} execute raft command err: {:?}", self.tag, e),
             }
             (cmd_resp::new_error(e), None)
@@ -1083,7 +1104,7 @@ impl ApplyDelegate {
         ctx: &mut ApplyContext,
     ) -> Result<(RaftCmdResponse, Option<ExecResult>)> {
         let req = Rc::clone(&ctx.exec_ctx.as_ref().unwrap().req);
-        // Include region for stale epoch after merge may cause key not in range.
+        // Include region for epoch not match after merge may cause key not in range.
         let include_region =
             req.get_header().get_region_epoch().get_version() >= self.last_merge_version;
         check_region_epoch(&req, &self.region, include_region)?;
@@ -2083,6 +2104,7 @@ pub struct Registration {
     pub apply_state: RaftApplyState,
     pub applied_index_term: u64,
     pub region: Region,
+    pub is_merging: bool,
 }
 
 impl Registration {
@@ -2093,6 +2115,7 @@ impl Registration {
             apply_state: peer.get_store().apply_state().clone(),
             applied_index_term: peer.get_store().applied_index_term(),
             region: peer.region().clone(),
+            is_merging: peer.pending_merge_state.is_some(),
         }
     }
 }
@@ -2299,7 +2322,7 @@ impl Runner {
                 .use_delete_range(self.use_delete_range)
                 .enable_sync_log(self.sync_log);
             for apply in applies {
-                if core.merged_regions.contains(&apply.region_id) {
+                if apply.entries.is_empty() || core.merged_regions.contains(&apply.region_id) {
                     continue;
                 }
 
@@ -2714,7 +2737,7 @@ mod tests {
         req.mut_admin_request()
             .set_cmd_type(AdminCmdType::ComputeHash);
         let wb = WriteBatch::new();
-        assert_eq!(should_write_to_engine(&req, wb.count()), true);
+        assert_eq!(should_write_to_engine(&req, wb.count(), false), true);
 
         // IngestSST command
         let mut req = Request::new();
@@ -2723,7 +2746,7 @@ mod tests {
         let mut cmd = RaftCmdRequest::new();
         cmd.mut_requests().push(req);
         let wb = WriteBatch::new();
-        assert_eq!(should_write_to_engine(&cmd, wb.count()), true);
+        assert_eq!(should_write_to_engine(&cmd, wb.count(), false), true);
 
         // Write batch keys reach WRITE_BATCH_MAX_KEYS
         let req = RaftCmdRequest::new();
@@ -2732,7 +2755,8 @@ mod tests {
             let key = format!("key_{}", i);
             wb.put(key.as_bytes(), b"value").unwrap();
         }
-        assert_eq!(should_write_to_engine(&req, wb.count()), true);
+        assert_eq!(should_write_to_engine(&req, wb.count(), false), true);
+        assert_eq!(should_write_to_engine(&req, wb.count(), true), false);
 
         // Write batch keys not reach WRITE_BATCH_MAX_KEYS
         let req = RaftCmdRequest::new();
@@ -2741,7 +2765,7 @@ mod tests {
             let key = format!("key_{}", i);
             wb.put(key.as_bytes(), b"value").unwrap();
         }
-        assert_eq!(should_write_to_engine(&req, wb.count()), false);
+        assert_eq!(should_write_to_engine(&req, wb.count(), false), false);
     }
 
     #[test]
@@ -3111,7 +3135,7 @@ mod tests {
         delegate.handle_raft_committed_entries(&mut apply_ctx, vec![put_entry].into());
         apply_ctx.write_to_db(&engines.kv);
         let resp = rx.try_recv().unwrap();
-        assert!(resp.get_header().get_error().has_stale_epoch());
+        assert!(resp.get_header().get_error().has_epoch_not_match());
         assert_eq!(delegate.applied_index_term, 2);
         assert_eq!(delegate.apply_state.get_applied_index(), 3);
 
@@ -3221,12 +3245,12 @@ mod tests {
             .ingest_sst(&meta1)
             .epoch(0, 3)
             .build();
-        let ingest_stale_epoch = EntryBuilder::new(11, 3)
+        let ingest_epoch_not_match = EntryBuilder::new(11, 3)
             .capture_resp(&mut delegate, tx.clone())
             .ingest_sst(&meta2)
             .epoch(0, 3)
             .build();
-        let entries = vec![put_ok, ingest_ok, ingest_stale_epoch];
+        let entries = vec![put_ok, ingest_ok, ingest_epoch_not_match];
         delegate.handle_raft_committed_entries(&mut apply_ctx, entries.into());
         apply_ctx.write_to_db(&engines.kv);
         let resp = rx.try_recv().unwrap();
@@ -3482,8 +3506,6 @@ mod tests {
         assert!(error_msg(&resp).contains("id count"), "{:?}", resp);
 
         let epoch = Rc::new(RefCell::new(delegate.region.get_region_epoch().clone()));
-        let mut new_version = epoch.borrow().get_version() + 1;
-        epoch.borrow_mut().set_version(new_version);
         let checker = SplitResultChecker {
             db: &engines.kv,
             origin_peers: &peers,
@@ -3497,11 +3519,11 @@ mod tests {
         let resp = exec_split(&mut delegate, splits.clone());
         // Split should succeed.
         assert!(!resp.get_header().has_error(), "{:?}", resp);
+        let mut new_version = epoch.borrow().get_version() + 1;
+        epoch.borrow_mut().set_version(new_version);
         checker.check(b"", b"k1", 8, &[9, 10, 11], true);
         checker.check(b"k1", b"k5", 1, &[3, 5, 7], false);
 
-        new_version = epoch.borrow().get_version() + 1;
-        epoch.borrow_mut().set_version(new_version);
         splits.mut_requests().clear();
         splits
             .mut_requests()
@@ -3510,11 +3532,11 @@ mod tests {
         let resp = exec_split(&mut delegate, splits.clone());
         // Right derive should be respected.
         assert!(!resp.get_header().has_error(), "{:?}", resp);
+        new_version = epoch.borrow().get_version() + 1;
+        epoch.borrow_mut().set_version(new_version);
         checker.check(b"k4", b"k5", 12, &[13, 14, 15], true);
         checker.check(b"k1", b"k4", 1, &[3, 5, 7], false);
 
-        new_version = epoch.borrow().get_version() + 2;
-        epoch.borrow_mut().set_version(new_version);
         splits.mut_requests().clear();
         splits
             .mut_requests()
@@ -3526,12 +3548,12 @@ mod tests {
         let resp = exec_split(&mut delegate, splits.clone());
         // Right derive should be respected.
         assert!(!resp.get_header().has_error(), "{:?}", resp);
+        new_version = epoch.borrow().get_version() + 2;
+        epoch.borrow_mut().set_version(new_version);
         checker.check(b"k1", b"k2", 16, &[17, 18, 19], true);
         checker.check(b"k2", b"k3", 20, &[21, 22, 23], true);
         checker.check(b"k3", b"k4", 1, &[3, 5, 7], false);
 
-        new_version = epoch.borrow().get_version() + 2;
-        epoch.borrow_mut().set_version(new_version);
         splits.mut_requests().clear();
         splits
             .mut_requests()
@@ -3543,6 +3565,8 @@ mod tests {
         let resp = exec_split(&mut delegate, splits.clone());
         // Right derive should be respected.
         assert!(!resp.get_header().has_error(), "{:?}", resp);
+        new_version = epoch.borrow().get_version() + 2;
+        epoch.borrow_mut().set_version(new_version);
         checker.check(b"k3", b"k31", 1, &[3, 5, 7], false);
         checker.check(b"k31", b"k32", 24, &[25, 26, 27], true);
         checker.check(b"k32", b"k4", 28, &[29, 30, 31], true);

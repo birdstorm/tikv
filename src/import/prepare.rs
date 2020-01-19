@@ -11,7 +11,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -26,11 +25,50 @@ use util::rocksdb::properties::SizeProperties;
 use super::client::*;
 use super::common::*;
 use super::engine::*;
+use super::metrics::*;
 use super::{Config, Error, Result};
 
 const MAX_RETRY_TIMES: u64 = 3;
 const RETRY_INTERVAL_SECS: u64 = 1;
 
+const SPLIT_WAIT_MAX_RETRY_TIMES: u64 = 64;
+const SPLIT_WAIT_INTERVAL_MILLIS: u64 = 8;
+const SPLIT_MAX_WAIT_INTERVAL_MILLIS: u64 = 1000;
+const SCATTER_WAIT_MAX_RETRY_TIMES: u64 = 128;
+const SCATTER_WAIT_INTERVAL_MILLIS: u64 = 50;
+const SCATTER_MAX_WAIT_INTERVAL_MILLIS: u64 = 5000;
+
+macro_rules! exec_with_retry {
+    ($tag:expr, $func:expr, $times:expr, $interval:expr, $max_duration:expr) => {
+        let start = Instant::now();
+        let mut interval = $interval;
+        for i in 0..$times {
+            if $func {
+                if i > 0 {
+                    debug!(
+                        "[{}] waited retry time:{} takes:{:?}",
+                        $tag,
+                        i,
+                        start.elapsed()
+                    );
+                }
+                break;
+            } else if i == $times - 1 {
+                warn!("[{}] still failed after exhausting all retries", $tag);
+            } else {
+                // Exponential back-off with max wait duration
+                interval = (2 * interval).min($max_duration);
+                thread::sleep(Duration::from_millis(interval));
+            }
+        }
+    };
+}
+
+/// PrepareJob is responsible for improving cluster data balance
+///
+/// The main job is:
+/// 1. split data into ranges according to region size and region distribution
+/// 2. split and scatter regions of a cluster before we import a large amount of data
 pub struct PrepareJob<Client> {
     tag: String,
     cfg: Config,
@@ -65,18 +103,11 @@ impl<Client: ImportClient> PrepareJob<Client> {
             }
         };
 
-        let num_prepares = self.prepare(&props);
+        IMPORT_EACH_PHASE.with_label_values(&["prepare"]).set(1.0);
+        let prepares = self.prepare(&props);
+        IMPORT_EACH_PHASE.with_label_values(&["prepare"]).set(0.0);
 
-        // PD needs some time to scatter regions. But we don't know how much
-        // time it should take, so we just calculate an approximate duration.
-        let wait_duration = Duration::from_millis(num_prepares as u64 * 100);
-        let wait_duration = cmp::min(wait_duration, self.cfg.max_prepare_duration.0);
-        info!(
-            "{} prepare {} ranges waits {:?}",
-            self.tag, num_prepares, wait_duration,
-        );
-        thread::sleep(wait_duration);
-
+        let num_prepares = prepares?;
         info!(
             "{} prepare {} ranges takes {:?}",
             self.tag,
@@ -91,10 +122,11 @@ impl<Client: ImportClient> PrepareJob<Client> {
         ))
     }
 
-    fn prepare(&self, props: &SizeProperties) -> usize {
+    fn prepare(&self, props: &SizeProperties) -> Result<usize> {
         let split_size = self.cfg.region_split_size.0 as usize;
         let mut ctx = RangeContext::new(Arc::clone(&self.client), split_size);
 
+        let mut wait_scatter_regions = vec![];
         let mut num_prepares = 0;
         let mut start = Vec::new();
         for (k, v) in props.index_handles.iter() {
@@ -104,7 +136,7 @@ impl<Client: ImportClient> PrepareJob<Client> {
             }
 
             let range = RangeInfo::new(&start, k, ctx.raw_size());
-            if let Ok(true) = self.run_prepare_job(range) {
+            if let Ok(true) = self.run_prepare_range_job(range, &mut wait_scatter_regions) {
                 num_prepares += 1;
             }
 
@@ -112,14 +144,35 @@ impl<Client: ImportClient> PrepareJob<Client> {
             ctx.reset(k);
         }
 
-        num_prepares
+        // We need to wait all regions for scattering finished.
+        let start = Instant::now();
+        while let Some(region_id) = wait_scatter_regions.pop() {
+            exec_with_retry!(
+                "scatter",
+                self.client.is_scatter_region_finished(region_id)?,
+                SCATTER_WAIT_MAX_RETRY_TIMES,
+                SCATTER_WAIT_INTERVAL_MILLIS,
+                SCATTER_MAX_WAIT_INTERVAL_MILLIS
+            );
+        }
+        info!(
+            "[{}] scatter all regions finished takes:{:?}",
+            self.tag,
+            start.elapsed()
+        );
+
+        Ok(num_prepares)
     }
 
-    fn run_prepare_job(&self, range: RangeInfo) -> Result<bool> {
+    fn run_prepare_range_job(
+        &self,
+        range: RangeInfo,
+        wait_scatter_regions: &mut Vec<u64>,
+    ) -> Result<bool> {
         let id = self.counter.fetch_add(1, Ordering::SeqCst);
         let tag = format!("[PrepareRangeJob {}:{}]", self.engine.uuid(), id);
         let job = PrepareRangeJob::new(tag, range, Arc::clone(&self.client));
-        job.run()
+        job.run(wait_scatter_regions)
     }
 }
 
@@ -134,7 +187,7 @@ impl<Client: ImportClient> PrepareRangeJob<Client> {
         PrepareRangeJob { tag, range, client }
     }
 
-    fn run(&self) -> Result<bool> {
+    fn run(&self, wait_scatter_regions: &mut Vec<u64>) -> Result<bool> {
         let start = Instant::now();
         info!("{} start {:?}", self.tag, self.range);
 
@@ -152,7 +205,7 @@ impl<Client: ImportClient> PrepareRangeJob<Client> {
             };
 
             for _ in 0..MAX_RETRY_TIMES {
-                match self.prepare(region) {
+                match self.prepare(region, wait_scatter_regions) {
                     Ok(v) => {
                         info!("{} takes {:?}", self.tag, start.elapsed());
                         return Ok(v);
@@ -170,31 +223,51 @@ impl<Client: ImportClient> PrepareRangeJob<Client> {
         Err(Error::PrepareRangeJobFailed(self.tag.clone()))
     }
 
-    fn prepare(&self, mut region: RegionInfo) -> Result<bool> {
+    fn prepare(&self, mut region: RegionInfo, wait_scatter_regions: &mut Vec<u64>) -> Result<bool> {
         if !self.need_split(&region) {
             return Ok(false);
         }
         match self.split_region(&region) {
             Ok(new_region) => {
+                // We need to wait for a few milliseconds, because PD may have
+                // not received any heartbeat from the new split region, such
+                // that PD cannot create scatter operator for the new split
+                // region because it doesn't have the meta data of the new split
+                // region.
+                exec_with_retry!(
+                    "split",
+                    self.client.has_region_id(new_region.region.id)?,
+                    SPLIT_WAIT_MAX_RETRY_TIMES,
+                    SPLIT_WAIT_INTERVAL_MILLIS,
+                    SPLIT_MAX_WAIT_INTERVAL_MILLIS
+                );
                 self.scatter_region(&new_region)?;
+                wait_scatter_regions.push(new_region.region.id);
+
                 Ok(true)
             }
             Err(Error::NotLeader(new_leader)) => {
                 region.leader = new_leader;
                 Err(Error::UpdateRegion(region))
             }
-            Err(Error::StaleEpoch(new_regions)) => {
-                let new_region = new_regions.iter().find(|&r| self.need_split(r)).cloned();
-                match new_region {
-                    Some(new_region) => {
+            Err(Error::EpochNotMatch(current_regions)) => {
+                let current_region = current_regions
+                    .iter()
+                    .find(|&r| self.need_split(r))
+                    .cloned();
+                match current_region {
+                    Some(current_region) => {
                         let new_leader = region
                             .leader
-                            .and_then(|p| find_region_peer(&new_region, p.get_store_id()));
-                        Err(Error::UpdateRegion(RegionInfo::new(new_region, new_leader)))
+                            .and_then(|p| find_region_peer(&current_region, p.get_store_id()));
+                        Err(Error::UpdateRegion(RegionInfo::new(
+                            current_region,
+                            new_leader,
+                        )))
                     }
                     None => {
-                        warn!("{} stale epoch {:?}", self.tag, new_regions);
-                        Err(Error::StaleEpoch(new_regions))
+                        warn!("{} epoch not match {:?}", self.tag, current_regions);
+                        Err(Error::EpochNotMatch(current_regions))
                     }
                 }
             }
@@ -216,14 +289,16 @@ impl<Client: ImportClient> PrepareRangeJob<Client> {
     fn split_region(&self, region: &RegionInfo) -> Result<RegionInfo> {
         let split_key = self.range.get_end();
         let res = match self.client.split_region(region, split_key) {
-            Ok(mut resp) => if !resp.has_region_error() {
-                Ok(resp)
-            } else {
-                match Error::from(resp.take_region_error()) {
-                    e @ Error::NotLeader(_) | e @ Error::StaleEpoch(_) => return Err(e),
-                    e => Err(e),
+            Ok(mut resp) => {
+                if !resp.has_region_error() {
+                    Ok(resp)
+                } else {
+                    match Error::from(resp.take_region_error()) {
+                        e @ Error::NotLeader(_) | e @ Error::EpochNotMatch(_) => return Err(e),
+                        e => Err(e),
+                    }
                 }
-            },
+            }
             Err(e) => Err(e),
         };
 

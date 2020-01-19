@@ -11,6 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use kvproto::errorpb::Error as ErrorHeader;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -30,7 +31,7 @@ use util::worker::{Runnable, Scheduler, Worker};
 
 use super::{
     Callback, CbContext, Cursor, Engine, Error, Iterator as EngineIterator, Modify, Result,
-    ScanMode, Snapshot,
+    ScanMode, Snapshot, TEMP_DIR,
 };
 
 pub use raftstore::store::engine::SyncSnapshot as RocksSnapshot;
@@ -247,6 +248,14 @@ impl Engine for RocksEngine {
     }
 
     fn async_snapshot(&self, _: &Context, cb: Callback<Self::Snap>) -> Result<()> {
+        fail_point!("rockskv_async_snapshot", |_| Err(box_err!(
+            "snapshot failed"
+        )));
+        fail_point!("rockskv_async_snapshot_not_leader", |_| {
+            let mut header = ErrorHeader::new();
+            header.mut_not_leader().set_region_id(100);
+            Err(Error::Request(header))
+        });
         box_try!(self.sched.schedule(Task::Snapshot(cb)));
         Ok(())
     }
@@ -286,35 +295,36 @@ impl Snapshot for RocksSnapshot {
 }
 
 impl<D: Deref<Target = DB> + Send> EngineIterator for DBIterator<D> {
-    fn next(&mut self) -> bool {
-        DBIterator::next(self)
+    fn next(&mut self) -> Result<bool> {
+        DBIterator::next(self).map_err(Error::RocksDb)
     }
 
-    fn prev(&mut self) -> bool {
-        DBIterator::prev(self)
+    fn prev(&mut self) -> Result<bool> {
+        DBIterator::prev(self).map_err(Error::RocksDb)
     }
 
     fn seek(&mut self, key: &Key) -> Result<bool> {
-        Ok(DBIterator::seek(self, key.as_encoded().as_slice().into()))
+        DBIterator::seek(self, key.as_encoded().as_slice().into()).map_err(Error::RocksDb)
     }
 
     fn seek_for_prev(&mut self, key: &Key) -> Result<bool> {
-        Ok(DBIterator::seek_for_prev(
-            self,
-            key.as_encoded().as_slice().into(),
-        ))
+        DBIterator::seek_for_prev(self, key.as_encoded().as_slice().into()).map_err(Error::RocksDb)
     }
 
-    fn seek_to_first(&mut self) -> bool {
-        DBIterator::seek(self, SeekKey::Start)
+    fn seek_to_first(&mut self) -> Result<bool> {
+        DBIterator::seek(self, SeekKey::Start).map_err(Error::RocksDb)
     }
 
-    fn seek_to_last(&mut self) -> bool {
-        DBIterator::seek(self, SeekKey::End)
+    fn seek_to_last(&mut self) -> Result<bool> {
+        DBIterator::seek(self, SeekKey::End).map_err(Error::RocksDb)
     }
 
-    fn valid(&self) -> bool {
-        DBIterator::valid(self)
+    fn valid(&self) -> Result<bool> {
+        DBIterator::valid(self).map_err(Error::RocksDb)
+    }
+
+    fn status(&self) -> Result<()> {
+        Ok(())
     }
 
     fn key(&self) -> &[u8] {

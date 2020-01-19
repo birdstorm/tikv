@@ -32,7 +32,7 @@
 //! to the scheduler.
 
 use std::fmt::{self, Debug, Display, Formatter};
-use std::u64;
+use std::{cmp, u64};
 
 use kvproto::kvrpcpb::CommandPri;
 use prometheus::HistogramTimer;
@@ -165,7 +165,7 @@ pub struct Scheduler<E: Engine> {
     // worker pool
     worker_pool: ThreadPool<SchedContext<E>>,
 
-    // high priority commands will be delivered to this pool
+    // high priority commands and system commands will be delivered to this pool
     high_priority_pool: ThreadPool<SchedContext<E>>,
 
     // used to control write flow
@@ -195,6 +195,7 @@ impl<E: Engine> Scheduler<E> {
                 .thread_count(worker_pool_size)
                 .build(),
             high_priority_pool: ThreadPoolBuilder::new(thd_name!("sched-high-pri-pool"), factory)
+                .thread_count(cmp::max(1, worker_pool_size / 2))
                 .build(),
             running_write_bytes: 0,
         }
@@ -243,10 +244,11 @@ impl<E: Engine> Scheduler<E> {
         tctx
     }
 
-    pub fn fetch_executor(&self, priority: CommandPri) -> Executor<E> {
-        let pool = match priority {
-            CommandPri::Low | CommandPri::Normal => &self.worker_pool,
-            CommandPri::High => &self.high_priority_pool,
+    fn fetch_executor(&self, priority: CommandPri, is_sys_cmd: bool) -> Executor<E> {
+        let pool = if priority == CommandPri::High || is_sys_cmd {
+            &self.high_priority_pool
+        } else {
+            &self.worker_pool
         };
         let pool_scheduler = pool.scheduler();
         let scheduler = self.scheduler.clone();
@@ -324,7 +326,7 @@ impl<E: Engine> Scheduler<E> {
         let task = self.dequeue_task(cid);
         let tag = task.tag;
         let ctx = task.context().clone();
-        let executor = self.fetch_executor(task.priority());
+        let executor = self.fetch_executor(task.priority(), task.cmd().is_sys_cmd());
 
         let cb = box move |(cb_ctx, snapshot)| {
             executor.execute(cb_ctx, snapshot, task);
@@ -486,6 +488,9 @@ fn gen_command_lock(latches: &Latches, cmd: &Command) -> Lock {
             let keys: Vec<&Key> = key_locks.iter().map(|x| &x.0).collect();
             latches.gen_lock(&keys)
         }
+        Command::ResolveLockLite {
+            ref resolve_keys, ..
+        } => latches.gen_lock(resolve_keys),
         Command::Commit { ref keys, .. } | Command::Rollback { ref keys, .. } => {
             latches.gen_lock(keys)
         }
@@ -560,8 +565,14 @@ mod tests {
                 scan_key: None,
                 key_locks: vec![(
                     Key::from_raw(b"k"),
-                    mvcc::Lock::new(mvcc::LockType::Put, b"k".to_vec(), 10, 20, None),
+                    mvcc::Lock::new(mvcc::LockType::Put, b"k".to_vec(), 10, 20, None, 0),
                 )],
+            },
+            Command::ResolveLockLite {
+                ctx: Context::new(),
+                start_ts: 10,
+                commit_ts: 0,
+                resolve_keys: vec![Key::from_raw(b"k")],
             },
         ];
 

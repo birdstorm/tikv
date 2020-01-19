@@ -55,6 +55,7 @@ const LOCKCF_MAX_MEM: usize = GB as usize;
 const RAFT_MIN_MEM: usize = 256 * MB as usize;
 const RAFT_MAX_MEM: usize = 2 * GB as usize;
 pub const LAST_CONFIG_FILE: &str = "last_tikv.toml";
+const MAX_BLOCK_SIZE: usize = 32 * MB as usize;
 
 fn memory_mb_for_cf(is_raft_db: bool, cf: &str) -> usize {
     let total_mem = sys_info::mem_info().unwrap().total * KB;
@@ -112,6 +113,20 @@ macro_rules! cf_config {
             pub disable_auto_compactions: bool,
             pub soft_pending_compaction_bytes_limit: ReadableSize,
             pub hard_pending_compaction_bytes_limit: ReadableSize,
+        }
+
+        impl $name {
+            fn validate(&self) -> Result<(), Box<dyn Error>> {
+                if self.block_size.0 as usize > MAX_BLOCK_SIZE {
+                    return Err(format!(
+                        "invalid block-size {} for {}, exceed max size {}",
+                        self.block_size.0,
+                        stringify!($name),
+                        MAX_BLOCK_SIZE
+                    ).into());
+                }
+                Ok(())
+            }
         }
     };
 }
@@ -424,7 +439,7 @@ impl Default for DbConfig {
             wal_size_limit: ReadableSize::kb(0),
             max_total_wal_size: ReadableSize::gb(4),
             max_background_jobs: 6,
-            max_manifest_file_size: ReadableSize::mb(20),
+            max_manifest_file_size: ReadableSize::mb(128),
             create_if_missing: true,
             max_open_files: 40960,
             enable_statistics: true,
@@ -503,6 +518,10 @@ impl DbConfig {
     }
 
     fn validate(&mut self) -> Result<(), Box<Error>> {
+        self.defaultcf.validate()?;
+        self.lockcf.validate()?;
+        self.writecf.validate()?;
+        self.raftcf.validate()?;
         Ok(())
     }
 }
@@ -676,6 +695,11 @@ impl RaftDbConfig {
 
     pub fn build_cf_opts(&self) -> Vec<CFOptions> {
         vec![CFOptions::new(CF_DEFAULT, self.defaultcf.build_opt())]
+    }
+
+    fn validate(&mut self) -> Result<(), Box<dyn Error>> {
+        self.defaultcf.validate()?;
+        Ok(())
     }
 }
 
@@ -921,6 +945,7 @@ pub struct TiKvConfig {
     pub log_level: slog::Level,
     pub log_file: String,
     pub log_rotation_timespan: ReadableDuration,
+    pub panic_when_unexpected_key_or_data: bool,
     pub readpool: ReadPoolConfig,
     pub server: ServerConfig,
     pub storage: StorageConfig,
@@ -941,6 +966,7 @@ impl Default for TiKvConfig {
             log_level: slog::Level::Info,
             log_file: "".to_owned(),
             log_rotation_timespan: ReadableDuration::hours(24),
+            panic_when_unexpected_key_or_data: false,
             readpool: ReadPoolConfig::default(),
             server: ServerConfig::default(),
             metric: MetricConfig::default(),
@@ -991,6 +1017,7 @@ impl TiKvConfig {
         }
 
         self.rocksdb.validate()?;
+        self.raftdb.validate()?;
         self.server.validate()?;
         self.raft_store.validate()?;
         self.pd.validate()?;
@@ -1145,17 +1172,31 @@ impl TiKvConfig {
     }
 }
 
-pub fn check_and_persist_critical_config(config: &TiKvConfig) -> Result<(), String> {
+/// Prevents launching with an incompatible configuration
+///
+/// Loads the previously-loaded configuration from `last_tikv.toml`,
+/// compares key configuration items and fails if they are not
+/// identical.
+pub fn check_critical_config(config: &TiKvConfig) -> Result<(), String> {
     // Check current critical configurations with last time, if there are some
     // changes, user must guarantee relevant works have been done.
     let store_path = Path::new(&config.storage.data_dir);
     let last_cfg_path = store_path.join(LAST_CONFIG_FILE);
+
     if last_cfg_path.exists() {
         let last_cfg = TiKvConfig::from_file(&last_cfg_path);
         if let Err(e) = config.check_critical_cfg_with(&last_cfg) {
             return Err(format!("check critical config failed, err {:?}", e));
         }
     }
+
+    Ok(())
+}
+
+/// Persists critical config to `last_tikv.toml`
+pub fn persist_critical_config(config: &TiKvConfig) -> Result<(), String> {
+    let store_path = Path::new(&config.storage.data_dir);
+    let last_cfg_path = store_path.join(LAST_CONFIG_FILE);
 
     // Create parent directory if missing.
     if let Err(e) = fs::create_dir_all(&store_path) {
@@ -1260,6 +1301,24 @@ mod tests {
         tikv_cfg.server.grpc_keepalive_time = ReadableDuration(dur);
         assert!(tikv_cfg.validate().is_err());
         tikv_cfg.server.grpc_keepalive_time = ReadableDuration(dur * 2);
+        tikv_cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn test_block_size() {
+        let mut tikv_cfg = TiKvConfig::default();
+        tikv_cfg.pd.endpoints = vec!["".to_owned()];
+        tikv_cfg.rocksdb.defaultcf.block_size = ReadableSize::gb(10);
+        tikv_cfg.rocksdb.lockcf.block_size = ReadableSize::gb(10);
+        tikv_cfg.rocksdb.writecf.block_size = ReadableSize::gb(10);
+        tikv_cfg.rocksdb.raftcf.block_size = ReadableSize::gb(10);
+        tikv_cfg.raftdb.defaultcf.block_size = ReadableSize::gb(10);
+        assert!(tikv_cfg.validate().is_err());
+        tikv_cfg.rocksdb.defaultcf.block_size = ReadableSize::kb(10);
+        tikv_cfg.rocksdb.lockcf.block_size = ReadableSize::kb(10);
+        tikv_cfg.rocksdb.writecf.block_size = ReadableSize::kb(10);
+        tikv_cfg.rocksdb.raftcf.block_size = ReadableSize::kb(10);
+        tikv_cfg.raftdb.defaultcf.block_size = ReadableSize::kb(10);
         tikv_cfg.validate().unwrap();
     }
 

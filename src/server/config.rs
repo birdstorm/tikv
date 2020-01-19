@@ -30,6 +30,7 @@ const DEFAULT_ADVERTISE_LISTENING_ADDR: &str = "";
 const DEFAULT_ENGINE_LISTENING_ADDR: &str = "127.0.0.1:3930";
 pub const DEFAULT_ENGINE_LABEL_KEY: &str = "engine";
 pub const DEFAULT_ENGINE_LABEL_VALUE: &str = "tiflash";
+const DEFAULT_STATUS_ADDR: &str = "127.0.0.1:20180";
 const DEFAULT_GRPC_CONCURRENCY: usize = 4;
 const DEFAULT_GRPC_CONCURRENT_STREAM: i32 = 1024;
 const DEFAULT_GRPC_RAFT_CONN_NUM: usize = 10;
@@ -68,6 +69,9 @@ pub struct Config {
     pub advertise_addr: String,
 
     pub engine_addr: String,
+    // These are related to TiKV status.
+    pub status_addr: String,
+    pub status_thread_pool_size: usize,
 
     // TODO: use CompressionAlgorithms instead once it supports traits like Clone etc.
     pub grpc_compression_type: GrpcCompressionType,
@@ -123,6 +127,8 @@ impl Default for Config {
                 .collect(),
             advertise_addr: DEFAULT_ADVERTISE_LISTENING_ADDR.to_owned(),
             engine_addr: DEFAULT_ENGINE_LISTENING_ADDR.to_owned(),
+            status_addr: DEFAULT_STATUS_ADDR.to_owned(),
+            status_thread_pool_size: 1,
             grpc_compression_type: GrpcCompressionType::None,
             grpc_concurrency: DEFAULT_GRPC_CONCURRENCY,
             grpc_concurrent_stream: DEFAULT_GRPC_CONCURRENT_STREAM,
@@ -172,6 +178,15 @@ impl Config {
 
         box_try!(config::check_addr(&self.engine_addr));
 
+        if !self.status_addr.is_empty() {
+            box_try!(config::check_addr(&self.status_addr));
+        }
+        if self.status_addr == self.advertise_addr {
+            return Err(box_err!(
+                "status-addr has already been used: {:?}",
+                self.advertise_addr
+            ));
+        }
         let non_zero_entries = vec![
             (
                 "concurrent-send-snap-limit",
@@ -306,6 +321,11 @@ mod tests {
         assert!(invalid_cfg.validate().is_err());
         invalid_cfg.advertise_addr = "127.0.0.1:1000".to_owned();
         invalid_cfg.validate().unwrap();
+
+        let mut invalid_cfg = cfg.clone();
+        invalid_cfg.advertise_addr = "127.0.0.1:1000".to_owned();
+        invalid_cfg.status_addr = "127.0.0.1:1000".to_owned();
+        assert!(invalid_cfg.validate().is_err());
 
         let mut invalid_cfg = cfg.clone();
         invalid_cfg.grpc_stream_initial_window_size = ReadableSize(i32::MAX as u64 + 1);

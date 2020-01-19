@@ -162,4 +162,17 @@ impl ImportClient for MockClient {
         regions.insert(region.get_id(), region.region.clone());
         Ok(())
     }
+
+    fn has_region_id(&self, region_id: u64) -> Result<bool> {
+        let regions = self.regions.lock().unwrap();
+        Ok(regions.contains_key(&region_id))
+    }
+
+    fn is_scatter_region_finished(&self, _: u64) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn is_space_enough(&self, _: u64, _: u64) -> Result<bool> {
+        Ok(true)
+    }
 }

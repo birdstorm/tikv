@@ -162,6 +162,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
     }
 
     pub fn poll_apply(&mut self) {
+        fail_point!("on_poll_apply", |_| {});
         loop {
             match self.apply_res_receiver.as_ref().unwrap().try_recv() {
                 Ok(ApplyTaskRes::Applies(multi_res)) => for res in multi_res {
@@ -739,17 +740,21 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let (kv_wb, raft_wb, append_res, sync_log, pending_sync_region) = {
             let mut ctx = ReadyContext::new(&mut self.raft_metrics, &self.trans, pending_count);
             for region_id in self.pending_raft_groups.drain() {
-                if let Some(mut peer) = self.region_peers.remove(&region_id) {
+                let check_pending_snapshot = if let Some(peer) = self.region_peers.get(&region_id) {
+                    peer.check_pending_snapshot(&self.region_ranges, &self.region_peers)
+                } else {
+                    continue;
+                };
+
+                if let Some(mut peer) = self.region_peers.get_mut(&region_id) {
                     if let Some(region_proposal) = peer.take_apply_proposals() {
                         region_proposals.push(region_proposal);
                     }
                     peer.handle_raft_ready_append(
                         &mut ctx,
                         &self.pd_worker,
-                        &self.region_ranges,
-                        &self.region_peers,
+                        check_pending_snapshot,
                     );
-                    self.region_peers.insert(region_id, peer);
                 }
             }
             (
@@ -999,6 +1004,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
             p.set_region(cp.region);
 
             let peer_id = cp.peer.get_id();
+            let now = Instant::now();
             match change_type {
                 ConfChangeType::AddNode | ConfChangeType::AddLearnerNode => {
                     let peer = cp.peer.clone();
@@ -1007,13 +1013,12 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                     }
 
                     // Add this peer to cache and heartbeats.
-                    let now = Instant::now();
                     let id = peer.get_id();
                     p.peer_heartbeats.insert(id, now);
                     if p.is_leader() {
                         p.peers_start_pending_time.push((id, now));
                     }
-                    p.recent_added_peer.update(id, now);
+                    p.recent_conf_change_time = now;
                     p.insert_peer_cache(peer);
                 }
                 ConfChangeType::RemoveNode => {
@@ -1023,6 +1028,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                         p.peers_start_pending_time.retain(|&(p, _)| p != peer_id);
                     }
                     p.remove_peer_from_cache(peer_id);
+                    p.recent_conf_change_time = now;
                 }
             }
 
@@ -1638,7 +1644,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         }
 
         match util::check_region_epoch(msg, peer.region(), true) {
-            Err(Error::StaleEpoch(msg, mut new_regions)) => {
+            Err(Error::EpochNotMatch(msg, mut new_regions)) => {
                 // Attach the region which might be split from the current region. But it doesn't
                 // matter if the region is not split from the current region. If the region meta
                 // received by the TiKV driver is newer than the meta cached in the driver, the meta is
@@ -1648,8 +1654,8 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                     let sibling_region = self.region_peers[&sibling_region_id].region();
                     new_regions.push(sibling_region.to_owned());
                 }
-                self.raft_metrics.invalid_proposal.stale_epoch += 1;
-                Err(Error::StaleEpoch(msg, new_regions))
+                self.raft_metrics.invalid_proposal.epoch_not_match += 1;
+                Err(Error::EpochNotMatch(msg, new_regions))
             }
             Err(e) => Err(e),
             Ok(()) => Ok(None),
@@ -1721,6 +1727,9 @@ impl<T: Transport, C: PdClient> Store<T, C> {
 
     #[cfg_attr(feature = "cargo-clippy", allow(if_same_then_else))]
     pub fn on_raft_gc_log_tick(&mut self, event_loop: &mut EventLoop<Self>) {
+        self.register_raft_gc_log_tick(event_loop);
+        fail_point!("on_raft_gc_log_tick", |_| {});
+
         // As leader, we would not keep caches for the peers that didn't response heartbeat in the
         // last few seconds. That happens probably because another TiKV is down. In this case if we
         // do not clean up the cache, it may keep growing.
@@ -1819,7 +1828,6 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         }
 
         PEER_GC_RAFT_LOG_COUNTER.inc_by(total_gc_logs as i64);
-        self.register_raft_gc_log_tick(event_loop);
     }
 
     pub fn register_split_region_check_tick(&self, event_loop: &mut EventLoop<Self>) {
@@ -1959,7 +1967,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
                 region.get_region_epoch(),
                 epoch
             );
-            return Err(Error::StaleEpoch(
+            return Err(Error::EpochNotMatch(
                 format!(
                     "{} epoch changed {:?} != {:?}, retry later",
                     peer.tag, latest_epoch, epoch

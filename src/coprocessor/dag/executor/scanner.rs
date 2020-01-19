@@ -16,7 +16,7 @@ use kvproto::coprocessor::KeyRange;
 use coprocessor::codec::table::truncate_as_row_key;
 use coprocessor::util;
 use storage::txn::Result;
-use storage::{Key, Scanner as KvScanner, Statistics, Store, Value};
+use storage::{Key, ScanMode, Snapshot, SnapshotStore, Statistics, Store, StoreScanner, Value};
 use util::{escape, set_panic_mark};
 
 const MIN_KEY_BUFFER_CAPACITY: usize = 256;

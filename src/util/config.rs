@@ -454,10 +454,11 @@ impl Serialize for ReadableDuration {
     {
         let mut dur = util::time::duration_to_ms(self.0);
         let mut buffer = String::new();
-        if dur >= DAY {
-            write!(buffer, "{}d", dur / DAY).unwrap();
-            dur %= DAY;
-        }
+        // For backward compatibility, do not render config that old version cannot parse.
+        // if dur >= DAY {
+        //     write!(buffer, "{}d", dur / DAY).unwrap();
+        //     dur %= DAY;
+        // }
         if dur >= HOUR {
             write!(buffer, "{}h", dur / HOUR).unwrap();
             dur %= HOUR;
@@ -1096,8 +1097,8 @@ mod tests {
             (0, 0, "0s"),
             (0, 1, "1ms"),
             (2, 0, "2s"),
-            (24 * 3600, 0, "1d"),
-            (2 * 24 * 3600, 10, "2d10ms"),
+            (24 * 3600, 0, "24h"),
+            (36 * 3600, 0, "36h"),
             (4 * 60, 0, "4m"),
             (5 * 3600, 0, "5h"),
             (3600 + 2 * 60, 0, "1h2m"),
@@ -1116,7 +1117,12 @@ mod tests {
             assert_eq!(res_dur.d.0, d.d.0);
         }
 
-        let decode_cases = vec![(" 0.5 h2m ", 3600 / 2 + 2 * 60, 0)];
+        let decode_cases = vec![
+            (" 0.5 h2m ", 3600 / 2 + 2 * 60, 0),
+            ("24h", 24 * 3600, 0),
+            ("1.5d", 36 * 3600, 0),
+            ("36h", 36 * 3600, 0),
+        ];
         for (src, secs, ms) in decode_cases {
             let src = format!("d = {:?}", src);
             let res: DurHolder = toml::from_str(&src).unwrap();

@@ -112,11 +112,11 @@ pub trait PdClient: Send + Sync {
     // and peers will be removed.
     // When doing auto-balance, pd determines how to move the region from one store to another.
 
-    // Get store information.
+    // Gets store information if it is not a tombstone store.
     fn get_store(&self, store_id: u64) -> Result<metapb::Store>;
 
-    // Get all stores information.
-    fn get_all_stores(&self) -> Result<Vec<metapb::Store>> {
+    // Gets all stores information.
+    fn get_all_stores(&self, _exlcude_tombstone: bool) -> Result<Vec<metapb::Store>> {
         unimplemented!();
     }
 
@@ -176,6 +176,12 @@ pub trait PdClient: Send + Sync {
     //
     // Please note that this method should only be called once.
     fn handle_reconnect<F: Fn() + Sync + Send + 'static>(&self, _: F) {}
+
+    /// Gets store state if it is not a tombstone store.
+    fn get_store_stats(&self, store_id: u64) -> Result<pdpb::StoreStats>;
+
+    /// Gets current operator of the region
+    fn get_operator(&self, region_id: u64) -> Result<pdpb::GetOperatorResponse>;
 }
 
 const REQUEST_TIMEOUT: u64 = 2; // 2s

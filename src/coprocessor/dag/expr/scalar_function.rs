@@ -192,8 +192,6 @@ impl ScalarFunc {
             | ScalarFuncSig::DayOfMonth
             | ScalarFuncSig::DayOfWeek
             | ScalarFuncSig::DayOfYear
-            | ScalarFuncSig::WeekDay
-            | ScalarFuncSig::WeekOfYear
             | ScalarFuncSig::Year
             | ScalarFuncSig::UnaryNot
             | ScalarFuncSig::UnaryMinusInt
@@ -420,6 +418,8 @@ impl ScalarFunc {
             | ScalarFuncSig::MakeDate
             | ScalarFuncSig::MakeSet
             | ScalarFuncSig::MakeTime
+            | ScalarFuncSig::MicroSecond
+            | ScalarFuncSig::Minute
             | ScalarFuncSig::NowWithArg
             | ScalarFuncSig::NowWithoutArg
             | ScalarFuncSig::NullTimeDiff
@@ -755,12 +755,6 @@ dispatch_call! {
         DayOfMonth => day_of_month,
         DayOfWeek => day_of_week,
         DayOfYear => day_of_year,
-        WeekWithMode => week_with_mode,
-        WeekWithoutMode => week_without_mode,
-        YearWeekWithMode => year_week_with_mode,
-        YearWeekWithoutMode => year_week_without_mode,
-        WeekDay => week_day,
-        WeekOfYear => week_of_year,
         Year => year,
 
         LogicalAnd => logical_and,
@@ -1215,8 +1209,6 @@ mod tests {
                     ScalarFuncSig::DayOfMonth,
                     ScalarFuncSig::DayOfWeek,
                     ScalarFuncSig::DayOfYear,
-                    ScalarFuncSig::WeekDay,
-                    ScalarFuncSig::WeekOfYear,
                     ScalarFuncSig::Year,
                     ScalarFuncSig::UnaryNot,
                     ScalarFuncSig::UnaryMinusInt,
@@ -1482,6 +1474,8 @@ mod tests {
             ScalarFuncSig::MakeDate,
             ScalarFuncSig::MakeSet,
             ScalarFuncSig::MakeTime,
+            ScalarFuncSig::MicroSecond,
+            ScalarFuncSig::Minute,
             ScalarFuncSig::NowWithArg,
             ScalarFuncSig::NowWithoutArg,
             ScalarFuncSig::NullTimeDiff,

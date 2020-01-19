@@ -1,6 +1,7 @@
 log-level = "debug"
 log-file = "foo"
-log-rotation-timespan = "1d"
+log-rotation-timespan = "24h"
+panic-when-unexpected-key-or-data = true
 [readpool.storage]
 high-concurrency = 1
 normal-concurrency = 3
@@ -23,6 +24,8 @@ stack-size = "12MB"
 addr = "example.com:443"
 advertise-addr = "example.com:443"
 engine-addr = "example.com:443"
+status-addr = "example.com:443"
+status-thread-pool-size = 1
 grpc-compression-type = "gzip"
 grpc-concurrency = 123
 grpc-concurrent-stream = 1234
@@ -382,3 +385,5 @@ max-prepare-duration = "12m"
 region-split-size = "123MB"
 stream-channel-window = 123
 max-open-engines = 2
+upload-speed-limit = "456MB"
+min-available-ratio = 0.05

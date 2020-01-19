@@ -24,13 +24,13 @@ use kvproto::errorpb::Error as PbError;
 use kvproto::metapb::{self, RegionEpoch};
 use kvproto::pdpb;
 use kvproto::raft_cmdpb::*;
-use kvproto::raft_serverpb::RaftMessage;
+use kvproto::raft_serverpb::{RaftApplyState, RaftMessage, RaftTruncatedState};
 
 use tikv::config::TiKvConfig;
 use tikv::pd::PdClient;
 use tikv::raftstore::store::*;
 use tikv::raftstore::{Error, Result};
-use tikv::storage::CF_DEFAULT;
+use tikv::storage::{CF_DEFAULT, CF_RAFT};
 use tikv::util::collections::{HashMap, HashSet};
 use tikv::util::transport::SendCh;
 use tikv::util::{escape, rocksdb, HandyRwLock};
@@ -563,7 +563,7 @@ impl<T: Simulator> Cluster<T> {
             }
 
             let resp = result.unwrap();
-            if resp.get_header().get_error().has_stale_epoch() {
+            if resp.get_header().get_error().has_epoch_not_match() {
                 warn!("seems split, let's retry");
                 sleep_ms(100);
                 continue;
@@ -643,6 +643,24 @@ impl<T: Simulator> Cluster<T> {
         } else {
             None
         }
+    }
+
+    pub fn must_put_kvs(&mut self, kvs: &[(Vec<u8>, Vec<u8>)]) {
+        self.must_put_kvs_cf("default", kvs);
+    }
+
+    pub fn must_put_kvs_cf(&mut self, cf: &str, kvs: &[(Vec<u8>, Vec<u8>)]) {
+        let mut cmds = vec![];
+        for (key, value) in kvs {
+            cmds.push(new_put_cf_cmd(cf, key, value))
+        }
+
+        let resp = self.request(&kvs[0].0, cmds, false, Duration::from_secs(5));
+        if resp.get_header().has_error() {
+            panic!("response {:?} has error", resp);
+        }
+        assert_eq!(resp.get_responses().len(), kvs.len());
+        assert_eq!(resp.get_responses()[0].get_cmd_type(), CmdType::Put);
     }
 
     pub fn must_put(&mut self, key: &[u8], value: &[u8]) {
@@ -745,6 +763,14 @@ impl<T: Simulator> Cluster<T> {
         status_resp.take_region_detail()
     }
 
+    pub fn truncated_state(&self, region_id: u64, store_id: u64) -> RaftTruncatedState {
+        self.get_engine(store_id)
+            .get_msg_cf::<RaftApplyState>(CF_RAFT, &keys::apply_state_key(region_id))
+            .unwrap()
+            .unwrap()
+            .take_truncated_state()
+    }
+
     pub fn add_send_filter<F: FilterFactory>(&self, factory: F) {
         let mut sim = self.sim.wl();
         for node_id in sim.get_node_ids() {
@@ -827,7 +853,7 @@ impl<T: Simulator> Cluster<T> {
                     let mut resp = write_resp.response;
                     if resp.get_header().has_error() {
                         let error = resp.get_header().get_error();
-                        if error.has_stale_epoch()
+                        if error.has_epoch_not_match()
                             || error.has_not_leader()
                             || error.has_stale_command()
                         {

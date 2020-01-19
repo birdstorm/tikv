@@ -33,7 +33,7 @@ use util::codec::number::{self, NumberEncoder};
 use util::codec::BytesSlice;
 
 pub use self::extension::*;
-pub use self::weekmode::WeekMode;
+use self::weekmode::WeekMode;
 
 pub use self::tz::Tz;
 

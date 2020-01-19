@@ -14,7 +14,7 @@
 use std::thread;
 use std::time::Duration;
 
-use prometheus::{self, Encoder, TextEncoder};
+use prometheus::{self, *};
 
 #[cfg(target_os = "linux")]
 mod threads_linux;
@@ -66,8 +66,16 @@ pub fn dump() -> String {
     let metric_familys = prometheus::gather();
     for mf in metric_familys {
         if let Err(e) = encoder.encode(&[mf], &mut buffer) {
-            warn!("ignore prometheus encoding error: {:?}", e);
+            warn!("prometheus encoding error: {:?}", e);
         }
     }
     String::from_utf8(buffer).unwrap()
+}
+
+lazy_static! {
+    pub static ref CRITICAL_ERROR: IntCounterVec = register_int_counter_vec!(
+        "tikv_critical_error_total",
+        "Counter of critical error.",
+        &["type"]
+    ).unwrap();
 }

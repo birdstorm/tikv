@@ -71,6 +71,7 @@ pub const DATA_CFS: &[CfName] = &[CF_DEFAULT, CF_LOCK, CF_WRITE];
 // Short value max len must <= 255.
 pub const SHORT_VALUE_MAX_LEN: usize = 64;
 pub const SHORT_VALUE_PREFIX: u8 = b'v';
+pub const TXN_SIZE_PREFIX: u8 = b't';
 
 pub fn is_short_value(value: &[u8]) -> bool {
     value.len() <= SHORT_VALUE_MAX_LEN
@@ -137,6 +138,12 @@ pub enum Command {
         txn_status: HashMap<u64, u64>,
         scan_key: Option<Key>,
         key_locks: Vec<(Key, Lock)>,
+    },
+    ResolveLockLite {
+        ctx: Context,
+        start_ts: u64,
+        commit_ts: u64,
+        resolve_keys: Vec<Key>,
     },
     DeleteRange {
         ctx: Context,
@@ -218,6 +225,7 @@ impl Display for Command {
                 start_key, limit, max_ts, ctx
             ),
             Command::ResolveLock { .. } => write!(f, "kv::resolve_lock"),
+            Command::ResolveLockLite { .. } => write!(f, "kv::resolve_lock_lite"),
             Command::DeleteRange {
                 ref ctx,
                 ref start_key,
@@ -277,6 +285,15 @@ impl Command {
         self.get_context().get_priority()
     }
 
+    pub fn is_sys_cmd(&self) -> bool {
+        match *self {
+            Command::ScanLock { .. }
+            | Command::ResolveLock { .. }
+            | Command::ResolveLockLite { .. } => true,
+            _ => false,
+        }
+    }
+
     pub fn priority_tag(&self) -> &'static str {
         match self.get_context().get_priority() {
             CommandPri::Low => "low",
@@ -297,6 +314,7 @@ impl Command {
             Command::Rollback { .. } => "rollback",
             Command::ScanLock { .. } => "scan_lock",
             Command::ResolveLock { .. } => "resolve_lock",
+            Command::ResolveLockLite { .. } => "resolve_lock_lite",
             Command::DeleteRange { .. } => "delete_range",
             Command::Pause { .. } => "pause",
             Command::MvccByKey { .. } => "key_mvcc",
@@ -312,6 +330,7 @@ impl Command {
             | Command::MvccByStartTs { start_ts, .. } => start_ts,
             Command::Commit { lock_ts, .. } => lock_ts,
             Command::ScanLock { max_ts, .. } => max_ts,
+            Command::ResolveLockLite { start_ts, .. } => start_ts,
             Command::ResolveLock { .. }
             | Command::DeleteRange { .. }
             | Command::Pause { .. }
@@ -327,6 +346,7 @@ impl Command {
             | Command::Rollback { ref ctx, .. }
             | Command::ScanLock { ref ctx, .. }
             | Command::ResolveLock { ref ctx, .. }
+            | Command::ResolveLockLite { ref ctx, .. }
             | Command::DeleteRange { ref ctx, .. }
             | Command::Pause { ref ctx, .. }
             | Command::MvccByKey { ref ctx, .. }
@@ -342,6 +362,7 @@ impl Command {
             | Command::Rollback { ref mut ctx, .. }
             | Command::ScanLock { ref mut ctx, .. }
             | Command::ResolveLock { ref mut ctx, .. }
+            | Command::ResolveLockLite { ref mut ctx, .. }
             | Command::DeleteRange { ref mut ctx, .. }
             | Command::Pause { ref mut ctx, .. }
             | Command::MvccByKey { ref mut ctx, .. }
@@ -371,6 +392,13 @@ impl Command {
             Command::ResolveLock { ref key_locks, .. } => for lock in key_locks {
                 bytes += lock.0.as_encoded().len();
             },
+            Command::ResolveLockLite {
+                ref resolve_keys, ..
+            } => {
+                for k in resolve_keys {
+                    bytes += k.as_encoded().len();
+                }
+            }
             Command::Cleanup { ref key, .. } => {
                 bytes += key.as_encoded().len();
             }
@@ -391,6 +419,7 @@ pub struct Options {
     pub skip_constraint_check: bool,
     pub key_only: bool,
     pub reverse_scan: bool,
+    pub txn_size: u64,
 }
 
 impl Options {
@@ -400,6 +429,7 @@ impl Options {
             skip_constraint_check,
             key_only,
             reverse_scan: false,
+            txn_size: 0,
         }
     }
 
@@ -716,23 +746,32 @@ impl<E: Engine> Storage<E> {
                         ctx.get_isolation_level(),
                         !ctx.get_not_fill_cache(),
                     );
-                    let kv_pairs: Vec<_> = snap_store
+                    let result = snap_store
                         .batch_get(&keys, &mut statistics)
-                        .into_iter()
-                        .zip(keys)
-                        .filter(|&(ref v, ref _k)| !(v.is_ok() && v.as_ref().unwrap().is_none()))
-                        .map(|(v, k)| match v {
-                            Ok(Some(x)) => Ok((k.into_raw().unwrap(), x)),
-                            Err(e) => Err(Error::from(e)),
-                            _ => unreachable!(),
-                        })
-                        .collect();
+                        // map storage::txn::Error -> storage::Error
+                        .map_err(Error::from)
+                        .map(|results| results
+                            .into_iter()
+                            .zip(keys)
+                            .filter(|&(ref v, ref _k)|
+                                !(v.is_ok() && v.as_ref().unwrap().is_none())
+                            )
+                            .map(|(v, k)| match v {
+                                Ok(Some(x)) => Ok((k.into_raw().unwrap(), x)),
+                                Err(e) => Err(Error::from(e)),
+                                _ => unreachable!(),
+                            })
+                            .collect()
+                        )
+                        .map(|r: Vec<Result<KvPair>>| {
+                            thread_ctx.collect_key_reads(CMD, r.len() as u64);
+                            r
+                        });
 
-                    thread_ctx.collect_key_reads(CMD, kv_pairs.len() as u64);
                     thread_ctx.collect_scan_count(CMD, &statistics);
                     thread_ctx.collect_read_flow(ctx.get_region_id(), &statistics);
 
-                    Ok(kv_pairs)
+                    result
                 })
                 .then(move |r| {
                     _timer.observe_duration();
@@ -780,11 +819,19 @@ impl<E: Engine> Storage<E> {
 
                     let mut scanner;
                     if !options.reverse_scan {
-                        scanner =
-                            snap_store.scanner(false, options.key_only, Some(start_key), end_key)?;
+                        scanner = snap_store.scanner(
+                            ScanMode::Forward,
+                            options.key_only,
+                            Some(start_key),
+                            end_key,
+                        )?;
                     } else {
-                        scanner =
-                            snap_store.scanner(true, options.key_only, end_key, Some(start_key))?;
+                        scanner = snap_store.scanner(
+                            ScanMode::Backward,
+                            options.key_only,
+                            end_key,
+                            Some(start_key),
+                        )?;
                     };
                     let res = scanner.scan(limit);
 
@@ -975,6 +1022,26 @@ impl<E: Engine> Storage<E> {
             txn_status,
             scan_key: None,
             key_locks: vec![],
+        };
+        let tag = cmd.tag();
+        self.schedule(cmd, StorageCb::Boolean(callback))?;
+        KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
+        Ok(())
+    }
+
+    pub fn async_resolve_lock_lite(
+        &self,
+        ctx: Context,
+        start_ts: u64,
+        commit_ts: u64,
+        resolve_keys: Vec<Key>,
+        callback: Callback<()>,
+    ) -> Result<()> {
+        let cmd = Command::ResolveLockLite {
+            ctx,
+            start_ts,
+            commit_ts,
+            resolve_keys,
         };
         let tag = cmd.tag();
         self.schedule(cmd, StorageCb::Boolean(callback))?;
@@ -1266,7 +1333,7 @@ impl<E: Engine> Storage<E> {
             return Ok(vec![]);
         }
         let mut pairs = vec![];
-        while cursor.valid() && pairs.len() < limit {
+        while cursor.valid()? && pairs.len() < limit {
             pairs.push(Ok((
                 cursor.key(statistics).to_owned(),
                 if key_only {
@@ -1298,7 +1365,7 @@ impl<E: Engine> Storage<E> {
             return Ok(vec![]);
         }
         let mut pairs = vec![];
-        while cursor.valid() && pairs.len() < limit {
+        while cursor.valid()? && pairs.len() < limit {
             pairs.push(Ok((
                 cursor.key(statistics).to_owned(),
                 if key_only {
@@ -1578,7 +1645,7 @@ pub enum ErrorHeaderKind {
     NotLeader,
     RegionNotFound,
     KeyNotInRegion,
-    StaleEpoch,
+    EpochNotMatch,
     ServerIsBusy,
     StaleCommand,
     StoreNotMatch,
@@ -1594,7 +1661,7 @@ impl ErrorHeaderKind {
             ErrorHeaderKind::NotLeader => "not_leader",
             ErrorHeaderKind::RegionNotFound => "region_not_found",
             ErrorHeaderKind::KeyNotInRegion => "key_not_in_region",
-            ErrorHeaderKind::StaleEpoch => "stale_epoch",
+            ErrorHeaderKind::EpochNotMatch => "epoch_not_match",
             ErrorHeaderKind::ServerIsBusy => "server_is_busy",
             ErrorHeaderKind::StaleCommand => "stale_command",
             ErrorHeaderKind::StoreNotMatch => "store_not_match",
@@ -1617,8 +1684,8 @@ pub fn get_error_kind_from_header(header: &errorpb::Error) -> ErrorHeaderKind {
         ErrorHeaderKind::RegionNotFound
     } else if header.has_key_not_in_region() {
         ErrorHeaderKind::KeyNotInRegion
-    } else if header.has_stale_epoch() {
-        ErrorHeaderKind::StaleEpoch
+    } else if header.has_epoch_not_match() {
+        ErrorHeaderKind::EpochNotMatch
     } else if header.has_server_is_busy() {
         ErrorHeaderKind::ServerIsBusy
     } else if header.has_stale_command() {
@@ -1870,6 +1937,201 @@ mod tests {
                 .wait(),
         );
         // Forward with bound
+        expect_multi_values(
+            vec![None, None],
+            storage
+                .async_scan(
+                    Context::new(),
+                    Key::from_raw(b"\x00"),
+                    Some(Key::from_raw(b"c")),
+                    1000,
+                    5,
+                    Options::default(),
+                )
+                .wait(),
+        );
+        // Backward with bound
+        expect_multi_values(
+            vec![None, None],
+            storage
+                .async_scan(
+                    Context::new(),
+                    Key::from_raw(b"\xff"),
+                    Some(Key::from_raw(b"b")),
+                    1000,
+                    5,
+                    Options::default().reverse_scan(),
+                )
+                .wait(),
+        );
+        // Forward with limit
+        expect_multi_values(
+            vec![None, None],
+            storage
+                .async_scan(
+                    Context::new(),
+                    Key::from_raw(b"\x00"),
+                    None,
+                    2,
+                    5,
+                    Options::default(),
+                )
+                .wait(),
+        );
+        // Backward with limit
+        expect_multi_values(
+            vec![None, None],
+            storage
+                .async_scan(
+                    Context::new(),
+                    Key::from_raw(b"\xff"),
+                    None,
+                    2,
+                    5,
+                    Options::default().reverse_scan(),
+                )
+                .wait(),
+        );
+
+        storage
+            .async_commit(
+                Context::new(),
+                vec![
+                    Key::from_raw(b"a"),
+                    Key::from_raw(b"b"),
+                    Key::from_raw(b"c"),
+                ],
+                1,
+                2,
+                expect_ok_callback(tx.clone(), 1),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        // Forward
+        expect_multi_values(
+            vec![None, None, None],
+            storage
+                .async_scan(
+                    Context::new(),
+                    Key::from_raw(b"\x00"),
+                    None,
+                    1000,
+                    5,
+                    Options::default().reverse_scan(),
+                )
+                .wait(),
+        );
+        // Backward
+        expect_multi_values(
+            vec![
+                Some((b"c".to_vec(), b"cc".to_vec())),
+                Some((b"b".to_vec(), b"bb".to_vec())),
+                Some((b"a".to_vec(), b"aa".to_vec())),
+            ],
+            storage
+                .async_scan(
+                    Context::new(),
+                    Key::from_raw(b"\xff"),
+                    None,
+                    1000,
+                    5,
+                    Options::default().reverse_scan(),
+                )
+                .wait(),
+        );
+        // Forward with bound
+        expect_multi_values(
+            vec![
+                Some((b"a".to_vec(), b"aa".to_vec())),
+                Some((b"b".to_vec(), b"bb".to_vec())),
+            ],
+            storage
+                .async_scan(
+                    Context::new(),
+                    Key::from_raw(b"\x00"),
+                    Some(Key::from_raw(b"c")),
+                    1000,
+                    5,
+                    Options::default(),
+                )
+                .wait(),
+        );
+        // Backward with bound
+        expect_multi_values(
+            vec![
+                Some((b"c".to_vec(), b"cc".to_vec())),
+                Some((b"b".to_vec(), b"bb".to_vec())),
+            ],
+            storage
+                .async_scan(
+                    Context::new(),
+                    Key::from_raw(b"\xff"),
+                    Some(Key::from_raw(b"b")),
+                    1000,
+                    5,
+                    Options::default().reverse_scan(),
+                )
+                .wait(),
+        );
+        storage.stop().unwrap();
+        // Forward with limit
+        expect_multi_values(
+            vec![
+                Some((b"a".to_vec(), b"aa".to_vec())),
+                Some((b"b".to_vec(), b"bb".to_vec())),
+            ],
+            storage
+                .async_scan(
+                    Context::new(),
+                    Key::from_raw(b"\x00"),
+                    None,
+                    2,
+                    5,
+                    Options::default(),
+                )
+                .wait(),
+        );
+        // Backward with limit
+        expect_multi_values(
+            vec![
+                Some((b"c".to_vec(), b"cc".to_vec())),
+                Some((b"b".to_vec(), b"bb".to_vec())),
+            ],
+            storage
+                .async_scan(
+                    Context::new(),
+                    Key::from_raw(b"\xff"),
+                    None,
+                    2,
+                    5,
+                    Options::default().reverse_scan(),
+                )
+                .wait(),
+        );
+    }
+
+    #[test]
+    fn test_batch_get() {
+        let read_pool = new_read_pool();
+        let config = Config::default();
+        let mut storage = Storage::new(&config, read_pool).unwrap();
+        storage.start(&config).unwrap();
+        let (tx, rx) = channel();
+        storage
+            .async_prewrite(
+                Context::new(),
+                vec![
+                    Mutation::Put((Key::from_raw(b"a"), b"aa".to_vec())),
+                    Mutation::Put((Key::from_raw(b"b"), b"bb".to_vec())),
+                    Mutation::Put((Key::from_raw(b"c"), b"cc".to_vec())),
+                ],
+                b"a".to_vec(),
+                1,
+                Options::default(),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
         expect_multi_values(
             vec![None, None],
             storage
@@ -2783,15 +3045,7 @@ mod tests {
         expect_multi_values(
             results.clone(),
             storage
-                .async_raw_scan(
-                    Context::new(),
-                    "".to_string(),
-                    vec![],
-                    None,
-                    20,
-                    true,
-                    false,
-                )
+                .async_raw_scan(Context::new(), "".to_string(), vec![], 20, true, false)
                 .wait(),
         );
         results = results.split_off(10);
@@ -3016,6 +3270,104 @@ mod tests {
                     )
                 })
                 .wait(),
+        );
+    }
+
+    #[test]
+    fn test_check_key_ranges() {
+        fn make_ranges(ranges: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<KeyRange> {
+            ranges
+                .into_iter()
+                .map(|(s, e)| {
+                    let mut range = KeyRange::new();
+                    range.set_start_key(s);
+                    if !e.is_empty() {
+                        range.set_end_key(e);
+                    }
+                    range
+                })
+                .collect()
+        }
+
+        let ranges = make_ranges(vec![
+            (b"a".to_vec(), b"a3".to_vec()),
+            (b"b".to_vec(), b"b3".to_vec()),
+            (b"c".to_vec(), b"c3".to_vec()),
+        ]);
+        assert_eq!(
+            <Storage<RocksEngine>>::check_key_ranges(&ranges, false),
+            true
+        );
+
+        let ranges = make_ranges(vec![
+            (b"a".to_vec(), vec![]),
+            (b"b".to_vec(), vec![]),
+            (b"c".to_vec(), vec![]),
+        ]);
+        assert_eq!(
+            <Storage<RocksEngine>>::check_key_ranges(&ranges, false),
+            true
+        );
+
+        let ranges = make_ranges(vec![
+            (b"a3".to_vec(), b"a".to_vec()),
+            (b"b3".to_vec(), b"b".to_vec()),
+            (b"c3".to_vec(), b"c".to_vec()),
+        ]);
+        assert_eq!(
+            <Storage<RocksEngine>>::check_key_ranges(&ranges, false),
+            false
+        );
+
+        // if end_key is omitted, the next start_key is used instead. so, false is returned.
+        let ranges = make_ranges(vec![
+            (b"c".to_vec(), vec![]),
+            (b"b".to_vec(), vec![]),
+            (b"a".to_vec(), vec![]),
+        ]);
+        assert_eq!(
+            <Storage<RocksEngine>>::check_key_ranges(&ranges, false),
+            false
+        );
+
+        let ranges = make_ranges(vec![
+            (b"a3".to_vec(), b"a".to_vec()),
+            (b"b3".to_vec(), b"b".to_vec()),
+            (b"c3".to_vec(), b"c".to_vec()),
+        ]);
+        assert_eq!(
+            <Storage<RocksEngine>>::check_key_ranges(&ranges, true),
+            true
+        );
+
+        let ranges = make_ranges(vec![
+            (b"c3".to_vec(), vec![]),
+            (b"b3".to_vec(), vec![]),
+            (b"a3".to_vec(), vec![]),
+        ]);
+        assert_eq!(
+            <Storage<RocksEngine>>::check_key_ranges(&ranges, true),
+            true
+        );
+
+        let ranges = make_ranges(vec![
+            (b"a".to_vec(), b"a3".to_vec()),
+            (b"b".to_vec(), b"b3".to_vec()),
+            (b"c".to_vec(), b"c3".to_vec()),
+        ]);
+        assert_eq!(
+            <Storage<RocksEngine>>::check_key_ranges(&ranges, true),
+            false
+        );
+
+        let ranges = make_ranges(vec![
+            (b"a3".to_vec(), vec![]),
+            (b"b3".to_vec(), vec![]),
+            (b"c3".to_vec(), vec![]),
+        ]);
+        assert_eq!(
+            <Storage<RocksEngine>>::check_key_ranges(&ranges, true),
+            false
         );
     }
 
@@ -3691,5 +4043,122 @@ mod tests {
                 ts += 10;
             }
         }
+    }
+
+    #[test]
+    fn test_resolve_lock_lite() {
+        let read_pool = new_read_pool();
+        let config = Config::default();
+        let mut storage = Storage::new(&config, read_pool).unwrap();
+        storage.start(&config).unwrap();
+        let (tx, rx) = channel();
+
+        storage
+            .async_prewrite(
+                Context::new(),
+                vec![
+                    Mutation::Put((Key::from_raw(b"a"), b"foo".to_vec())),
+                    Mutation::Put((Key::from_raw(b"b"), b"foo".to_vec())),
+                    Mutation::Put((Key::from_raw(b"c"), b"foo".to_vec())),
+                ],
+                b"c".to_vec(),
+                99,
+                Options::default(),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+
+        // Rollback key 'b' and key 'c' and left key 'a' still locked.
+        let resolve_keys = vec![Key::from_raw(b"b"), Key::from_raw(b"c")];
+        storage
+            .async_resolve_lock_lite(
+                Context::new(),
+                99,
+                0,
+                resolve_keys,
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+
+        // Check lock for key 'a'.
+        let lock_a = {
+            let mut lock = LockInfo::new();
+            lock.set_primary_lock(b"c".to_vec());
+            lock.set_lock_version(99);
+            lock.set_key(b"a".to_vec());
+            lock
+        };
+        storage
+            .async_scan_locks(
+                Context::new(),
+                99,
+                vec![],
+                0,
+                expect_value_callback(tx.clone(), 0, vec![lock_a]),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+
+        // Resolve lock for key 'a'.
+        storage
+            .async_resolve_lock_lite(
+                Context::new(),
+                99,
+                0,
+                vec![Key::from_raw(b"a")],
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+
+        storage
+            .async_prewrite(
+                Context::new(),
+                vec![
+                    Mutation::Put((Key::from_raw(b"a"), b"foo".to_vec())),
+                    Mutation::Put((Key::from_raw(b"b"), b"foo".to_vec())),
+                    Mutation::Put((Key::from_raw(b"c"), b"foo".to_vec())),
+                ],
+                b"c".to_vec(),
+                101,
+                Options::default(),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+
+        // Commit key 'b' and key 'c' and left key 'a' still locked.
+        let resolve_keys = vec![Key::from_raw(b"b"), Key::from_raw(b"c")];
+        storage
+            .async_resolve_lock_lite(
+                Context::new(),
+                101,
+                102,
+                resolve_keys,
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+
+        // Check lock for key 'a'.
+        let lock_a = {
+            let mut lock = LockInfo::new();
+            lock.set_primary_lock(b"c".to_vec());
+            lock.set_lock_version(101);
+            lock.set_key(b"a".to_vec());
+            lock
+        };
+        storage
+            .async_scan_locks(
+                Context::new(),
+                101,
+                vec![],
+                0,
+                expect_value_callback(tx.clone(), 0, vec![lock_a]),
+            )
+            .unwrap();
+        rx.recv().unwrap();
     }
 }

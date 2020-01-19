@@ -19,7 +19,8 @@ use std::sync::Arc;
 use raftstore::store::engine::{IterOption, Peekable, Snapshot, SyncSnapshot};
 use raftstore::store::{keys, util, PeerStorage};
 use raftstore::Result;
-use util::set_panic_mark;
+use util::metrics::CRITICAL_ERROR;
+use util::{panic_when_unexpected_key_or_data, set_panic_mark};
 
 /// Snapshot of a region.
 ///
@@ -106,7 +107,7 @@ impl RegionSnapshot {
             }
         }
 
-        Ok(())
+        it.status()
     }
 
     pub fn get_properties_cf(&self, cf: &str) -> Result<TablePropertiesCollection> {
@@ -314,9 +315,17 @@ impl RegionIterator {
     }
 
     #[inline]
+    pub fn status(&self) -> Result<()> {
+        self.iter.status().map_err(From::from)
+    }
+
+    #[inline]
     pub fn should_seekable(&self, key: &[u8]) -> Result<()> {
         if let Err(e) = util::check_key_in_region_inclusive(key, &self.region) {
-            if self.panic_when_exceed_bound {
+            CRITICAL_ERROR
+                .with_label_values(&["key not in region"])
+                .inc();
+            if panic_when_unexpected_key_or_data() {
                 set_panic_mark();
                 panic!("key exceed bound: {:?}", e);
             } else {
@@ -665,8 +674,7 @@ mod tests {
 
         let snap = RegionSnapshot::new(&store);
         let mut statistics = CFStatistics::default();
-        let mut it = snap.iter(IterOption::default());
-        it.panic_when_exceed_bound(false);
+        let it = snap.iter(IterOption::default());
         let mut iter = Cursor::new(it, ScanMode::Mixed);
         assert!(
             !iter
@@ -725,8 +733,7 @@ mod tests {
         region.mut_peers().push(Peer::new());
         let store = new_peer_storage(engines, &region);
         let snap = RegionSnapshot::new(&store);
-        let mut it = snap.iter(IterOption::default());
-        it.panic_when_exceed_bound(false);
+        let it = snap.iter(IterOption::default());
         let mut iter = Cursor::new(it, ScanMode::Mixed);
         assert!(
             !iter

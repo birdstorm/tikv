@@ -25,7 +25,6 @@ extern crate log;
 extern crate grpcio as grpc;
 #[cfg(unix)]
 extern crate nix;
-extern crate prometheus;
 extern crate rocksdb;
 extern crate serde_json;
 #[cfg(unix)]
@@ -37,6 +36,7 @@ extern crate slog_stdlog;
 extern crate slog_term;
 #[macro_use]
 extern crate tikv;
+extern crate hyper;
 extern crate toml;
 
 #[cfg(unix)]
@@ -57,7 +57,7 @@ use clap::{App, Arg};
 use fs2::FileExt;
 use grpc::EnvBuilder;
 
-use tikv::config::{check_and_persist_critical_config, TiKvConfig};
+use tikv::config::TiKvConfig;
 use tikv::coprocessor;
 use tikv::import::{ImportSSTService, SSTImporter};
 use tikv::pd::{PdClient, RpcClient};
@@ -65,6 +65,7 @@ use tikv::raftstore::coprocessor::CoprocessorHost;
 use tikv::raftstore::store::{self, new_compaction_listener, Engines, SnapManagerBuilder};
 use tikv::server::readpool::ReadPool;
 use tikv::server::resolve;
+use tikv::server::status_server::StatusServer;
 use tikv::server::transport::ServerRaftStoreRouter;
 use tikv::server::{create_raft_storage, Node, Server, DEFAULT_CLUSTER_ID};
 use tikv::storage::{self, DEFAULT_ROCKSDB_SUB_DIR};
@@ -95,6 +96,17 @@ fn check_system_config(config: &TiKvConfig) {
     // check raft data dir
     if let Err(e) = tikv_util::config::check_data_dir(&config.raft_store.raftdb_path) {
         warn!("raft check data dir: {:?}", e);
+    }
+}
+
+fn pre_start(cfg: &TiKvConfig) {
+    // Before any startup, check system configuration and environment variables.
+    check_system_config(&cfg);
+    check_environment_variables();
+
+    if cfg.panic_when_unexpected_key_or_data {
+        info!("panic-when-unexpected-key-or-data is on");
+        tikv_util::set_panic_when_unexpected_key_or_data(true);
     }
 }
 
@@ -262,12 +274,31 @@ fn run_raft_server(pd_client: RpcClient, cfg: &TiKvConfig, security_mgr: Arc<Sec
     server
         .start(server_cfg, security_mgr)
         .unwrap_or_else(|e| fatal!("failed to start server: {:?}", e));
+
+    let server_cfg = cfg.server.clone();
+    let mut status_enabled = cfg.metric.address.is_empty() && !server_cfg.status_addr.is_empty();
+
+    // Create a status server.
+    let mut status_server = StatusServer::new(server_cfg.status_thread_pool_size);
+    if status_enabled {
+        // Start the status server.
+        if let Err(e) = status_server.start(server_cfg.status_addr) {
+            error!("failed to bind addr for status service, error: {:?}", e);
+            status_enabled = false;
+        }
+    }
+
     signal_handler::handle_signal(Some(engines));
 
     // Stop.
     server
         .stop()
         .unwrap_or_else(|e| fatal!("failed to stop server: {:?}", e));
+
+    if status_enabled {
+        // Stop the status server.
+        status_server.stop()
+    }
 
     metrics_flusher.stop();
 
@@ -292,6 +323,13 @@ fn main() {
                 .takes_value(true),
         )
         .arg(
+            Arg::with_name("config-check")
+                .required(false)
+                .long("config-check")
+                .takes_value(false)
+                .help("Check config file validity and exit"),
+        )
+        .arg(
             Arg::with_name("addr")
                 .short("A")
                 .long("addr")
@@ -305,6 +343,13 @@ fn main() {
                 .takes_value(true)
                 .value_name("IP:PORT")
                 .help("Sets advertise listening address for client communication"),
+        )
+        .arg(
+            Arg::with_name("status-addr")
+                .long("status-addr")
+                .takes_value(true)
+                .value_name("IP:PORT")
+                .help("Sets HTTP listening address for the status report service"),
         )
         .arg(
             Arg::with_name("log-level")
@@ -392,32 +437,30 @@ fn main() {
 
     overwrite_config_with_cmd_args(&mut config, &matches);
 
-    if let Err(e) = check_and_persist_critical_config(&config) {
-        fatal!("check critical config failed, error {:?}", e);
+    if matches.is_present("config-check") {
+        validate_and_persist_config(&mut config, false);
+        println!("config check successful");
+        process::exit(0)
+    } else {
+        validate_and_persist_config(&mut config, true);
     }
 
     // Sets the global logger ASAP.
     // It is okay to use the config w/o `validate()`,
-    // because `initial_logger()` handles various conditions.
-    initial_logger(&config).cancel_reset();
-    tikv_util::set_panic_hook(false, &config.storage.data_dir);
+    // because `init_log()` handles various conditions.
+    let guard = init_log(&config);
+    tikv_util::panic_hook::set_exit_hook(false, Some(guard), &config.storage.data_dir);
 
     // Print version information.
     util::print_tikv_info();
 
-    config.compatible_adjust();
-    if let Err(e) = config.validate() {
-        fatal!("invalid configuration: {:?}", e);
-    }
     info!(
         "using config: {}",
         serde_json::to_string_pretty(&config).unwrap()
     );
 
-    // Before any startup, check system configuration.
-    check_system_config(&config);
-
-    check_environment_variables();
+    // Do some prepare works before start.
+    pre_start(&config);
 
     let security_mgr = Arc::new(
         SecurityManager::new(&config.security)

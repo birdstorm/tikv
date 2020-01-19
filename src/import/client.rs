@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,9 +22,11 @@ use grpc::{CallOption, Channel, ChannelBuilder, EnvBuilder, Environment, WriteFl
 use kvproto::import_sstpb::*;
 use kvproto::import_sstpb_grpc::*;
 use kvproto::kvrpcpb::*;
+use kvproto::pdpb::OperatorStatus;
 use kvproto::tikvpb_grpc::*;
+use rocksdb::SequentialFile;
 
-use pd::{Config as PdConfig, PdClient, RegionInfo, RpcClient};
+use pd::{Config as PdConfig, Error as PdError, PdClient, RegionInfo, RpcClient};
 use storage::types::Key;
 use util::collections::{HashMap, HashMapEntry};
 use util::security::SecurityManager;
@@ -53,16 +55,29 @@ pub trait ImportClient: Send + Sync + Clone + 'static {
     fn ingest_sst(&self, _: u64, _: IngestRequest) -> Result<IngestResponse> {
         unimplemented!()
     }
+
+    fn has_region_id(&self, _: u64) -> Result<bool> {
+        unimplemented!()
+    }
+
+    fn is_scatter_region_finished(&self, _: u64) -> Result<bool> {
+        unimplemented!()
+    }
+
+    fn is_space_enough(&self, _: u64, _: u64) -> Result<bool> {
+        unimplemented!()
+    }
 }
 
 pub struct Client {
     pd: Arc<RpcClient>,
     env: Arc<Environment>,
     channels: Mutex<HashMap<u64, Channel>>,
+    min_available_ratio: f64,
 }
 
 impl Client {
-    pub fn new(pd_addr: &str, cq_count: usize) -> Result<Client> {
+    pub fn new(pd_addr: &str, cq_count: usize, min_available_ratio: f64) -> Result<Client> {
         let cfg = PdConfig {
             endpoints: vec![pd_addr.to_owned()],
         };
@@ -76,6 +91,7 @@ impl Client {
             pd: Arc::new(rpc_client),
             env: Arc::new(env),
             channels: Mutex::new(HashMap::default()),
+            min_available_ratio,
         })
     }
 
@@ -108,7 +124,8 @@ impl Client {
 
     pub fn switch_cluster(&self, req: &SwitchModeRequest) -> Result<()> {
         let mut futures = Vec::new();
-        for store in self.pd.get_all_stores()? {
+        // Exclude tombstone stores.
+        for store in self.pd.get_all_stores(true)? {
             let ch = match self.resolve(store.get_id()) {
                 Ok(v) => v,
                 Err(e) => {
@@ -135,7 +152,8 @@ impl Client {
 
     pub fn compact_cluster(&self, req: &CompactRequest) -> Result<()> {
         let mut futures = Vec::new();
-        for store in self.pd.get_all_stores()? {
+        // Exclude tombstone stores.
+        for store in self.pd.get_all_stores(true)? {
             let ch = match self.resolve(store.get_id()) {
                 Ok(v) => v,
                 Err(e) => {
@@ -167,6 +185,7 @@ impl Clone for Client {
             pd: Arc::clone(&self.pd),
             env: Arc::clone(&self.env),
             channels: Mutex::new(HashMap::default()),
+            min_available_ratio: self.min_available_ratio,
         }
     }
 }
@@ -208,27 +227,54 @@ impl ImportClient for Client {
         let res = client.ingest_opt(&req, self.option(Duration::from_secs(30)));
         self.post_resolve(store_id, res.map_err(Error::from))
     }
+
+    fn has_region_id(&self, id: u64) -> Result<bool> {
+        Ok(self.pd.get_region_by_id(id).wait()?.is_some())
+    }
+
+    fn is_scatter_region_finished(&self, region_id: u64) -> Result<bool> {
+        match self.pd.get_operator(region_id) {
+            Ok(resp) => {
+                // If the current operator of region is not `scatter-region`, we could assume
+                // that `scatter-operator` has finished or timeout.
+                Ok(resp.desc != b"scatter-region" || resp.status != OperatorStatus::RUNNING)
+            }
+            Err(PdError::RegionNotFound(_)) => Ok(true), // heartbeat may not send to PD
+            Err(err) => {
+                error!(
+                    "check scatter region operator result region_id:{}, err:{}",
+                    region_id, err
+                );
+                Err(Error::from(err))
+            }
+        }
+    }
+
+    fn is_space_enough(&self, store_id: u64, size: u64) -> Result<bool> {
+        let stats = self.pd.get_store_stats(store_id)?;
+        let available_ratio = (stats.available - size) as f64 / stats.capacity as f64;
+        // Ensure target store have available disk space
+        Ok(available_ratio > self.min_available_ratio)
+    }
 }
 
-pub struct UploadStream<'a> {
+pub struct UploadStream<R = SequentialFile> {
     meta: Option<SSTMeta>,
-    size: usize,
-    cursor: Cursor<&'a [u8]>,
+    data: R,
 }
 
-impl<'a> UploadStream<'a> {
-    pub fn new(meta: SSTMeta, data: &[u8]) -> UploadStream {
-        UploadStream {
+impl<R> UploadStream<R> {
+    pub fn new(meta: SSTMeta, data: R) -> Self {
+        Self {
             meta: Some(meta),
-            size: data.len(),
-            cursor: Cursor::new(data),
+            data,
         }
     }
 }
 
 const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
 
-impl<'a> Stream for UploadStream<'a> {
+impl<R: Read> Stream for UploadStream<R> {
     type Item = (UploadRequest, WriteFlags);
     type Error = Error;
 
@@ -241,13 +287,15 @@ impl<'a> Stream for UploadStream<'a> {
             return Ok(Async::Ready(Some((chunk, flags))));
         }
 
-        let mut buf = match self.size - self.cursor.position() as usize {
-            0 => return Ok(Async::Ready(None)),
-            n if n > UPLOAD_CHUNK_SIZE => vec![0; UPLOAD_CHUNK_SIZE],
-            n => vec![0; n],
-        };
+        let mut buf = Vec::with_capacity(UPLOAD_CHUNK_SIZE);
+        self.data
+            .by_ref()
+            .take(UPLOAD_CHUNK_SIZE as u64)
+            .read_to_end(&mut buf)?;
+        if buf.is_empty() {
+            return Ok(Async::Ready(None));
+        }
 
-        self.cursor.read_exact(buf.as_mut_slice())?;
         let mut chunk = UploadRequest::new();
         chunk.set_data(buf);
         Ok(Async::Ready(Some((chunk, flags))))
@@ -268,7 +316,7 @@ mod tests {
         let mut data = vec![0u8; UPLOAD_CHUNK_SIZE * 4];
         rand::thread_rng().fill_bytes(&mut data);
 
-        let mut stream = UploadStream::new(meta.clone(), &data);
+        let mut stream = UploadStream::new(meta.clone(), &*data);
 
         // Check meta.
         if let Async::Ready(Some((upload, _))) = stream.poll().unwrap() {

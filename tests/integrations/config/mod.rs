@@ -61,6 +61,8 @@ fn test_serde_custom_tikv_config() {
         engine_addr: "example.com:443".to_owned(),
         labels: map!{ "a".to_owned() => "b".to_owned() },
         advertise_addr: "example.com:443".to_owned(),
+        status_addr: "example.com:443".to_owned(),
+        status_thread_pool_size: 1,
         concurrent_send_snap_limit: 4,
         concurrent_recv_snap_limit: 4,
         grpc_compression_type: GrpcCompressionType::Gzip,
@@ -441,7 +443,10 @@ fn test_serde_custom_tikv_config() {
         region_split_size: ReadableSize::mb(123),
         stream_channel_window: 123,
         max_open_engines: 2,
+        upload_speed_limit: ReadableSize::mb(456),
+        min_available_ratio: 0.05,
     };
+    value.panic_when_unexpected_key_or_data = true;
 
     let custom = read_file_in_project_dir("tests/integrations/config/test-custom.toml");
     let load = toml::from_str(&custom).unwrap();

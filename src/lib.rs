@@ -21,9 +21,12 @@
 #![feature(box_syntax)]
 #![feature(integer_atomics)]
 #![feature(duration_as_u128)]
+#![feature(duration_float)]
 #![feature(entry_or_default)]
 #![feature(proc_macro_non_items)]
 #![feature(proc_macro_gen)]
+#![feature(proc_macro_hygiene)]
+#![feature(specialization)]
 #![feature(ascii_ctype)]
 #![feature(const_int_ops)]
 #![feature(use_extern_macros)]
@@ -83,9 +86,12 @@ extern crate serde_json;
 #[cfg_attr(
     test,
     macro_use(
+        kv,
         slog_o,
         slog_kv,
-        slog_crit,
+        slog_info,
+        slog_debug,
+        slog_warn,
         slog_log,
         slog_record,
         slog_b,
@@ -115,15 +121,10 @@ extern crate uuid;
 extern crate zipf;
 #[macro_use]
 extern crate derive_more;
-extern crate safemem;
-extern crate smallvec;
+extern crate hyper;
+extern crate tokio_threadpool;
 #[macro_use]
 extern crate more_asserts;
-extern crate base64;
-
-extern crate cop_datatype;
-extern crate flate2;
-extern crate panic_hook;
 
 #[macro_use]
 pub mod util;

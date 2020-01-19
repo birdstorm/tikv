@@ -14,7 +14,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crc::crc32::{self, Hasher32};
 use uuid::Uuid;
 
 use kvproto::import_sstpb::*;
@@ -24,11 +23,11 @@ use rocksdb::{DBIterator, SeekKey, DB};
 use super::client::*;
 use super::common::*;
 use super::engine::*;
-use super::{Config, Result};
+use super::{Config, Error, Result};
 
 pub struct SSTFile {
     pub meta: SSTMeta,
-    pub data: Vec<u8>,
+    pub(crate) info: LazySSTInfo,
 }
 
 impl SSTFile {
@@ -51,7 +50,7 @@ impl fmt::Debug for SSTFile {
     }
 }
 
-pub type SSTRange = (Range, Vec<SSTFile>);
+pub type LazySSTRange = (Range, Vec<LazySSTInfo>);
 
 pub struct SSTFileStream<Client> {
     ctx: RangeContext<Client>,
@@ -80,8 +79,8 @@ impl<Client: ImportClient> SSTFileStream<Client> {
         }
     }
 
-    pub fn next(&mut self) -> Result<Option<SSTRange>> {
-        if !self.iter.valid() {
+    pub fn next(&mut self) -> Result<Option<LazySSTRange>> {
+        if !self.iter.valid()? {
             return Ok(None);
         }
 
@@ -96,12 +95,12 @@ impl<Client: ImportClient> SSTFileStream<Client> {
                 w.put(k, v)?;
                 self.ctx.add(k.len() + v.len());
             }
-            if !self.iter.next() || self.ctx.should_stop_before(self.iter.key()) {
+            if !self.iter.next()? || self.ctx.should_stop_before(self.iter.key()) {
                 break;
             }
         }
 
-        let end = if self.iter.valid() {
+        let end = if self.iter.valid()? {
             self.iter.key()
         } else {
             self.stream_range.get_end()
@@ -109,31 +108,7 @@ impl<Client: ImportClient> SSTFileStream<Client> {
         let range = new_range(&start, end);
 
         let infos = w.finish()?;
-        let mut ssts = Vec::new();
-        for info in infos {
-            ssts.push(self.new_sst_file(info));
-        }
-
-        Ok(Some((range, ssts)))
-    }
-
-    fn new_sst_file(&self, info: SSTInfo) -> SSTFile {
-        let mut digest = crc32::Digest::new(crc32::IEEE);
-        digest.write(&info.data);
-        let crc32 = digest.sum32();
-        let length = info.data.len() as u64;
-
-        let mut meta = SSTMeta::new();
-        meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
-        meta.set_range(info.range.clone());
-        meta.set_crc32(crc32);
-        meta.set_length(length);
-        meta.set_cf_name(info.cf_name.clone());
-
-        SSTFile {
-            meta,
-            data: info.data,
-        }
+        Ok(Some((range, infos)))
     }
 }
 
@@ -179,25 +154,25 @@ impl RangeIterator {
         };
 
         // Seek to the first valid range.
-        res.seek_next();
+        res.seek_next().unwrap();
         res
     }
 
-    pub fn next(&mut self) -> bool {
+    pub fn next(&mut self) -> Result<bool> {
         if !self.iter.next() {
-            return false;
+            return Ok(false);
         }
         {
             let range = &self.ranges[self.ranges_index];
             if before_end(self.iter.key(), range.get_end()) {
-                return true;
+                return Ok(true);
             }
             self.ranges_index += 1;
         }
         self.seek_next()
     }
 
-    fn seek_next(&mut self) -> bool {
+    fn seek_next(&mut self) -> Result<bool> {
         while let Some(range) = self.ranges.get(self.ranges_index) {
             if !self.iter.seek(SeekKey::Key(range.get_start())) {
                 break;
@@ -219,8 +194,15 @@ impl RangeIterator {
         self.iter.value()
     }
 
-    pub fn valid(&self) -> bool {
-        self.iter.valid() && self.ranges_index < self.ranges.len()
+    pub fn valid(&self) -> Result<bool> {
+        if !self.iter.valid() {
+            if let Err(e) = self.iter.status() {
+                return Err(Error::RocksDB(e));
+            }
+            Ok(false)
+        } else {
+            Ok(self.ranges_index < self.ranges.len())
+        }
     }
 }
 
@@ -269,10 +251,10 @@ mod tests {
         for i in start..end {
             let k = format!("k-{:04}", i);
             let v = format!("v-{:04}", i);
-            assert!(iter.valid());
+            assert!(iter.valid().unwrap());
             assert_eq!(iter.key(), k.as_bytes());
             assert_eq!(iter.value(), v.as_bytes());
-            iter.next();
+            iter.next().unwrap();
         }
     }
 
@@ -291,7 +273,7 @@ mod tests {
         for &(start, end) in unfinished_ranges {
             check_range_iter(&mut iter, start, end);
         }
-        assert!(!iter.valid());
+        assert!(!iter.valid().unwrap());
     }
 
     #[test]
@@ -490,8 +472,8 @@ mod tests {
             assert_eq!(range.get_start(), start.as_slice());
             assert_eq!(range.get_end(), range_end.as_slice());
             for sst in ssts {
-                assert_eq!(sst.meta.get_range().get_start(), start.as_slice());
-                assert_eq!(sst.meta.get_range().get_end(), end.as_slice());
+                assert_eq!(sst.range.get_start(), start.as_slice());
+                assert_eq!(sst.range.get_end(), end.as_slice());
             }
         }
         assert!(stream.next().unwrap().is_none());
